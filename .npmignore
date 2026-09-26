@@ -1,0 +1,7 @@
+# The Go sources, tests and dev scripts ship via git, not via npm.
+# `files` already limits the tarball to bin/, backend/, vendor/ and the docs;
+# this keeps build noise out of backend/.
+__pycache__/
+*.pyc
+*.pyo
+*.log

@@ -1,0 +1,60 @@
+{
+  "name": "@hell0beta/earshot",
+  "version": "0.1.0",
+  "description": "Live, local captions for whatever your speakers are playing - WASAPI loopback + on-device Whisper, in your terminal",
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Hell0Beta/earshot.git"
+  },
+  "homepage": "https://github.com/Hell0Beta/earshot#readme",
+  "bugs": {
+    "url": "https://github.com/Hell0Beta/earshot/issues"
+  },
+  "author": "hell0beta",
+  "bin": {
+    "earshot": "bin/earshot.js"
+  },
+  "engines": {
+    "node": ">=14"
+  },
+  "os": [
+    "win32"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "files": [
+    "bin/",
+    "backend/",
+    "vendor/",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "prepack": "node -e \"require('fs').rmSync('backend/__pycache__',{recursive:true,force:true})\" && cd go && go build -trimpath -ldflags \"-s -w\" -o ../vendor/earshot.exe .",
+    "test": "cd go && go test ./... && cd ../backend && ../.venv/Scripts/python.exe test_assembler.py"
+  },
+  "keywords": [
+    "captions",
+    "subtitles",
+    "live",
+    "whisper",
+    "transcription",
+    "asr",
+    "speech-to-text",
+    "loopback",
+    "wasapi",
+    "tui",
+    "terminal",
+    "offline",
+    "privacy",
+    "meetings",
+    "zoom",
+    "teams",
+    "accessibility"
+  ],
+  "license": "MIT"
+}

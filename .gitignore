@@ -1,0 +1,32 @@
+# python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# transcripts (yours, not the project's)
+transcripts/*.md
+transcripts/*.backend.log
+!transcripts/.gitkeep
+
+# build output - the npm tarball is produced by `npm run prepack`
+go/*.exe
+go/main.exe
+vendor/
+
+# test + scratch output from development
+*.log
+*.jsonl
+*.wav
+_probe*.json
+
+# editors / OS
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# editor/OS backups
+*.exe~
+*~
+
