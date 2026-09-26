@@ -9,7 +9,13 @@ import (
 	"strings"
 )
 
-const version = "0.2.0"
+// version is stamped at build time from package.json by scripts/prepack.js
+// (-X main.version). It is a var, not a const, so the linker can override it.
+// Keeping a hand-written copy of the version in two places guaranteed drift:
+// the published 1.2.0 tarball reported "earshot 0.2.0" because this line was
+// never updated. A plain `go build` yields "dev", which is the honest answer
+// for an unstamped build.
+var version = "dev"
 
 func usage() {
 	fmt.Print(`earshot - live, local captions for whatever your speakers are playing
@@ -76,6 +82,15 @@ func runDoctor(args []string) int {
 	}
 	checks = append(checks, check{"data dir", writable, true, dd.String(),
 		"set EARSHOT_HOME to a writable folder"})
+
+	// 1b. EARSHOT_HOME is advisory, never blocking. Unset means the data dir
+	// falls back to %LOCALAPPDATA%\earshot, so a machine that keeps its model
+	// cache on another volume silently re-downloads ~460 MB on first run.
+	if strings.TrimSpace(os.Getenv(envHome)) == "" {
+		checks = append(checks, check{"EARSHOT_HOME", false, false,
+			"not set - models and transcripts use " + dd.Path,
+			`set EARSHOT_HOME to pick a folder; default is %LOCALAPPDATA%\earshot`})
+	}
 
 	// 2. python
 	py, pyErr := resolvePython("")

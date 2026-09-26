@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 )
 
 // Path resolution. Nothing here may assume a particular working directory:
@@ -36,7 +37,13 @@ func (r resolved) String() string {
 
 // dataDir is the writable root for models, transcripts and the fallback venv.
 func dataDir() resolved {
-	if v := os.Getenv(envHome); v != "" {
+	// Trim before trusting it: a whitespace-only EARSHOT_HOME is a
+	// misconfiguration, not a destination. Falling through to the default keeps
+	// earshot usable and `doctor` warns about it, whereas an untrimmed blank
+	// reaches MkdirAll as an empty path and fails with a bare "data dir FAIL"
+	// that names no directory. A batch shim's `set VAR= ` leaves exactly such a
+	// space behind, so this is reachable in practice.
+	if v := strings.TrimSpace(os.Getenv(envHome)); v != "" {
 		return resolved{os.ExpandEnv(v), envHome}
 	}
 	if v := os.Getenv("LOCALAPPDATA"); v != "" {

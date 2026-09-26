@@ -251,3 +251,32 @@ func TestDirExistsRejectsFiles(t *testing.T) {
 		t.Errorf("dirExists must reject a plain file")
 	}
 }
+
+// A batch shim's `set VAR= ` leaves a single space in the variable, which
+// os.Getenv reports as non-empty. Treating that as a real path sends an empty
+// directory to MkdirAll and yields a "data dir FAIL" naming no folder, so
+// blank values must fall through to the default instead.
+func TestDataDirIgnoresBlankEnv(t *testing.T) {
+	for _, blank := range []string{"", " ", "\t", "  \t "} {
+		local := t.TempDir()
+		t.Setenv(envHome, blank)
+		t.Setenv("LOCALAPPDATA", local)
+
+		got := dataDir()
+		if got.Source != "LOCALAPPDATA" {
+			t.Errorf("dataDir with EARSHOT_HOME=%q = %v, want LOCALAPPDATA fallback", blank, got)
+		}
+		if want := filepath.Join(local, "earshot"); got.Path != want {
+			t.Errorf("dataDir with EARSHOT_HOME=%q = %q, want %q", blank, got.Path, want)
+		}
+	}
+}
+
+// Surrounding whitespace on a genuine value is noise, not part of the path.
+func TestDataDirTrimsEnv(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv(envHome, "  "+dir+"\t")
+	if got := dataDir(); got.Path != dir || got.Source != envHome {
+		t.Errorf("dataDir = %v, want %s from %s", got, dir, envHome)
+	}
+}

@@ -166,6 +166,32 @@ earshot doctor    # "GPU visible to ctranslate2: 1 CUDA device(s)"
 The first run downloads the model into `<data>/models` (~460 MB for `small.en`).
 The animated splash covers the wait.
 
+### Where files live
+
+Models, transcripts and the fallback venv share one writable root, called the
+**data dir**:
+
+| Platform | Default                                                  |
+| -------- | -------------------------------------------------------- |
+| Windows  | `%LOCALAPPDATA%\earshot`                                  |
+| Other    | `~/.earshot`                                              |
+
+Set `EARSHOT_HOME` to move it &mdash; useful when `%LOCALAPPDATA%` is small, or
+to keep a large model cache on a faster or roomier drive:
+
+```powershell
+[Environment]::SetEnvironmentVariable("EARSHOT_HOME", "D:\earshot", "User")
+```
+
+Run `earshot doctor` to confirm. If the variable is unset, `earshot doctor`
+prints a `[warn]` line naming the folder that will be used, because a silent
+~460 MB download on first run surprises people who already have the model
+somewhere else.
+
+> A shell that was already open when you set the variable keeps its old
+> environment and will still resolve the default. Open a new terminal, or set
+> `$env:EARSHOT_HOME` in the current one.
+
 ### Choosing a window length and a model
 
 Measured on a Quadro RTX 3000, scoring word precision against known speech
@@ -242,6 +268,7 @@ Protocol, if you want to build on it: one JSON object per line on stdout
 | Another earshot is already running         | **Only run one at a time** &mdash; two backends on one audio device will fight, and the second can wedge. |
 | The GPU vanished after a restart (Code 45) | A laptop power-gating quirk, not earshot. Cold boot on AC: `shutdown /s /t 0`, hold power 15s, boot plugged in. |
 | First inference seems to hang for a few seconds | Normal: the first CUDA call loads and autotunes kernels. Windows' 2-second GPU watchdog used to kill it; raise it with `TdrDelay=30` if you hit `LiveKernelEvent 141` in the event log. |
+| First run took minutes and downloaded the model | The model downloads on first run (~460 MB for `small.en`, ~1.5 GB for `medium.en`). Later runs start in ~2s. If you keep models on another drive, set `EARSHOT_HOME` so the cache is not re-fetched. |
 | Transcripts filling the disk               | `earshot --keep 10`, or `--no-prune` to disable entirely.                           |
 
 `earshot doctor` is the first thing to run for any of the above.

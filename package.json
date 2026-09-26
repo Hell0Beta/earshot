@@ -1,6 +1,6 @@
 {
   "name": "@hell0beta/earshot",
-  "version": "0.2.0",
+  "version": "1.2.0",
   "description": "Live, local captions for whatever your speakers are playing - WASAPI loopback + on-device Whisper, in your terminal",
   "publishConfig": {
     "access": "public"
@@ -34,7 +34,7 @@
     "LICENSE"
   ],
   "scripts": {
-    "prepack": "node -e \"require('fs').rmSync('backend/__pycache__',{recursive:true,force:true})\" && cd go && go build -trimpath -ldflags \"-s -w\" -o ../vendor/earshot.exe .",
+    "prepack": "node scripts/prepack.js",
     "test": "cd go && go test ./... && cd ../backend && ../.venv/Scripts/python.exe test_assembler.py"
   },
   "keywords": [
