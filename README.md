@@ -48,8 +48,9 @@ npx @hell0beta/earshot
   Teams, Zoom, a browser tab, a game, anything routed to your output device
 - 🔒 **100% local** &mdash; Whisper runs on your own GPU via CUDA; no audio ever
   leaves the machine
-- ⚡ **Word-by-word live line** &mdash; the in-progress sentence streams in at
-  ~2&times;/sec with a block cursor, then commits into 120-character blocks
+- ⚡ **Live line, not a slideshow** &mdash; the in-progress sentence grows word by
+  word as each window is transcribed, then commits into 120-character blocks.
+  The window is 1.5&nbsp;s, so you read roughly 0.75&nbsp;s behind the speaker.
 - 🧩 **Sentence blocks, newest first** &mdash; readable chunks with a blank line
   separating the newest from the history, wrapped to your terminal width
 - 🎨 **Animated 5&times;5 splash** &mdash; a pixel-art `EARSHOT` banner with a
@@ -123,7 +124,7 @@ Requirements: **Windows 10/11 x64**, Python 3.9+ on `PATH` (only for the one-tim
 | `--model NAME`      | Whisper model (`small.en`, `base.en`, `medium.en`, `turbo`) | `small.en`         |
 | `--device WHAT`     | `auto`, `cuda` or `cpu`                                  | `auto`               |
 | `--compute-type T`  | CTranslate2 compute type                                 | auto per device      |
-| `--chunk-secs N`    | capture window length                                    | `1.0`                |
+| `--chunk-secs N`    | capture window length (also the worst-case caption lag)   | `1.5`                |
 | `--overlap-secs N`  | window overlap                                           | `0.2`                |
 | `--block-chars N`   | characters per committed sentence                        | `120`                |
 | `--chain-chars N`   | trailing characters chained into the next block          | `15`                 |
@@ -164,6 +165,31 @@ earshot doctor    # "GPU visible to ctranslate2: 1 CUDA device(s)"
 
 The first run downloads the model into `<data>/models` (~460 MB for `small.en`).
 The animated splash covers the wait.
+
+### Choosing a window length and a model
+
+Measured on a Quadro RTX 3000, scoring word precision against known speech
+(higher is better, `stutters` counts repeated word pairs):
+
+| Model | Window | Precision | Stutters |
+| --------- | ------ | --------- | -------- |
+| `small.en` | 1.5s  | **0.93**  | 0        |
+| `medium.en`| 1.5s  | 0.91      | 0        |
+| `small.en` | 1.0s  | 0.86      | 0        |
+| `medium.en`| 1.0s  | 0.79      | 0        |
+
+Two things worth knowing, because both are counter-intuitive:
+
+- **Window length matters more than model size.** A bigger model on a short
+  window is *worse*, not better &mdash; `medium.en` invents whole phrases
+  (`description`, `devices`, `video`) on half a second of audio, where
+  `small.en` on 1.5s does not.
+- **Precision, not recall, is the thing to watch.** Every config captured
+  100% of the reference words. Bad output is *extra* invented words, never
+  missing ones &mdash; so if captions look wrong, make the window longer
+  rather than reaching for a larger model.
+
+On CPU, prefer `base.en`; `small.en` is slower than real time there.
 
 ---
 
@@ -208,8 +234,9 @@ Protocol, if you want to build on it: one JSON object per line on stdout
 | Nothing appears, footer says `starting backend…` | The backend died. Read the `.backend.log` next to the transcript &mdash; it has the exact error. |
 | Nothing appears, says `○ backend down`     | Backend exited. `earshot doctor` will say which check failed.                        |
 | No captions but audio is playing           | Wrong capture device. `earshot doctor` &rarr; "audio capture device"; plug in headphones or pass `--device-index`. |
-| Captions lag behind the audio              | Lower `--chunk-secs` (e.g. `0.8`) or use a bigger model.                            |
-| Repeated or garbled words                  | Overlap too small for the model. Try `--overlap-secs 0.3` or `--model medium.en`.  |
+| Captions lag behind the audio              | Lower `--chunk-secs` (e.g. `1.0`). Accuracy drops with it &mdash; 1.5s measured 0.93 precision vs 0.86 at 1.0s. |
+| Repeated or garbled words                  | Overlap too small for the model. Try `--overlap-secs 0.3`.  |
+| Whispers up extra words that were never said | Short windows make it confabulate. **Raise** `--chunk-secs`, do not lower it. |
 | Phantom phrases during silence             | Whisper hallucinating on noise. `--block-chars 200` and a larger model help.       |
 | `CUDA failed with error no CUDA-capable device` | GPU is asleep or held. See the note below.                                  |
 | Another earshot is already running         | **Only run one at a time** &mdash; two backends on one audio device will fight, and the second can wedge. |

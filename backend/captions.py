@@ -507,11 +507,11 @@ def main():
     ap.add_argument("--model-dir", default=DEFAULT_MODEL_DIR)
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--compute-type", default="float16")
-    ap.add_argument("--chunk-secs", type=float, default=1.0)
+    ap.add_argument("--chunk-secs", type=float, default=1.5)
     ap.add_argument("--overlap-secs", type=float, default=0.2)
     ap.add_argument("--language", default="en")
     ap.add_argument("--silence-threshold", type=float, default=0.005)
-    ap.add_argument("--block-chars", type=int, default=200,
+    ap.add_argument("--block-chars", type=int, default=120,
                     help="sentence block size: emit a final per this many chars")
     ap.add_argument("--chain-chars", type=int, default=15,
                     help="trailing runes of the previous line chained into the next")

@@ -1,6 +1,6 @@
 {
   "name": "@hell0beta/earshot",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Live, local captions for whatever your speakers are playing - WASAPI loopback + on-device Whisper, in your terminal",
   "publishConfig": {
     "access": "public"

@@ -426,7 +426,7 @@ func main() {
 	hfCache := flag.String("hf-cache", "", "HF hub cache dir (default <data>/models/hf-hub)")
 	deviceFlag := flag.String("device", "auto", "inference device: auto, cuda or cpu")
 	computeFlag := flag.String("compute-type", "", "ctranslate2 compute type (auto)")
-	chunkSecs := flag.Float64("chunk-secs", 1.0, "capture window seconds")
+	chunkSecs := flag.Float64("chunk-secs", 1.5, "capture window seconds")
 	overlapSecs := flag.Float64("overlap-secs", 0.2, "window overlap seconds")
 	blockChars := flag.Int("block-chars", 120, "sentence block size")
 	chainChars := flag.Int("chain-chars", 15, "trailing runes chained into next line")
