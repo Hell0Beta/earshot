@@ -18,6 +18,8 @@ vendor/
 *.log
 *.jsonl
 *.wav
+*.m4a
+*.mp4
 _probe*.json
 
 # editors / OS

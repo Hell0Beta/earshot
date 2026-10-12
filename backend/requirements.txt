@@ -5,3 +5,8 @@ ctranslate2>=4.0.0
 PyAudioWPatch==0.2.12.8
 numpy>=1.26
 scipy>=1.12
+
+# Optional: LLM correction pass (--correct-model). CPU-only, no GPU contention
+# with Whisper. No PyPI wheel builds on this toolchain; install from the
+# maintainer's prebuilt CPU index:
+#   pip install llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu

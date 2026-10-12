@@ -12,6 +12,7 @@ Protocol discipline:
 """
 
 import argparse
+import collections
 import faulthandler
 import json
 import math
@@ -20,6 +21,7 @@ import queue
 import sys
 import threading
 import time
+import traceback
 import wave
 
 import numpy as np
@@ -78,9 +80,27 @@ def resample_to_16k(mono, src_rate):
 
 
 def bytes_to_mono16k(raw, channels, src_rate):
+    # Truncate to whole int16 samples before frombuffer. numpy raises
+    # "buffer size must be a multiple of element size" on an odd byte count,
+    # which killed the backend whenever a step produced one.
+    raw = bytes(raw)
+    if len(raw) % 2:
+        raw = raw[:-1]
     audio = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
-    audio = audio[: (len(audio) // channels) * channels].reshape(-1, channels)
-    return resample_to_16k(audio.mean(axis=1), src_rate)
+    if channels > 1:
+        audio = audio[: (len(audio) // channels) * channels].reshape(-1, channels)
+        audio = audio.mean(axis=1)
+    return resample_to_16k(audio, src_rate)
+
+
+def frame_bytes_for(channels):
+    """Bytes per audio frame in the device's own format.
+
+    The step size must be snapped to this: a byte count that is not a whole
+    number of frames cannot be reshaped to (-1, channels), and int16 needs
+    an even length regardless.
+    """
+    return max(1, int(channels) * 2)
 
 
 def cmd_list_devices(p):
@@ -217,31 +237,8 @@ def load_model(args):
     return model
 
 
-def collect_window(q, n_bytes, timeout, stop_event=None):
-    """Drain up to n_bytes from q within timeout; zero-pad shortfall.
-
-    The loopback delivers nothing while idle, so wall-clock (not callbacks)
-    drives chunking. Missing bytes == digital silence.
-    """
-    out = bytearray()
-    deadline = time.time() + timeout
-    while len(out) < n_bytes:
-        if stop_event is not None and stop_event.is_set():
-            break
-        remaining = deadline - time.time()
-        if remaining <= 0:
-            break
-        try:
-            out.extend(q.get(timeout=min(remaining, 0.25)))
-        except queue.Empty:
-            continue
-    if len(out) < n_bytes:
-        out.extend(b"\x00" * (n_bytes - len(out)))
-    return bytes(out)
-
-
 class SentenceAssembler:
-    """Accumulates chunk texts into fixed-size display blocks.
+    """Accumulate chunk texts into fixed-size display blocks.
 
     Length-driven, never time-driven: the first line takes up to
     `block_chars` runes; every following line chains the last `chain_chars`
@@ -250,8 +247,13 @@ class SentenceAssembler:
     emitted line stays within `block_chars`. Cuts land on word boundaries
     (hard cut only for a spaceless run longer than the limit); the remainder
     stays buffered. `flush()` emits whatever is left (e.g. on session stop).
-    buf_t0 is the start of the oldest unconsumed text; per-char timing isn't
-    tracked, so line timestamps overlap slightly by design.
+    buf_t0 is the start of the oldest unconsumed text.
+
+    Receives only *committed* words from the streamer, so there is nothing to
+    dedup here: RollingStreamer's stable-prefix rule already decided what is
+    new. The earlier design trimmed overlap by text similarity and added error
+    faster than it removed it (167.5% WER against a Genesis 4 reference); see
+    docs/streaming-latency.md for the full record.
     """
 
     def __init__(self, block_chars=200, chain_chars=15):
@@ -274,38 +276,8 @@ class SentenceAssembler:
 
     @staticmethod
     def _norm(word):
-        return word.lower().strip(",.!?;:")
-
-    @classmethod
-    def _collapse_repeats(cls, text):
-        """Drop immediately-repeated words ("is is", "from from").
-
-        Short windows make Whisper occasionally repeat a token; adjacent exact
-        duplicates are never legitimate speech.
-        """
-        out = []
-        for w in text.split():
-            if out and cls._norm(out[-1]) == cls._norm(w):
-                continue
-            out.append(w)
-        return " ".join(out)
-
-    def _trim_overlap(self, text):
-        """Strip words the new chunk repeats from the buffer tail.
-
-        Consecutive windows overlap by design, so chunk N+1 usually restates
-        the tail of chunk N. Without trimming, the live line stutters. The
-        threshold is 2 words: window overlaps of 0.2s routinely restate one
-        or two words, and at a known boundary a 2-word repeat is not speech.
-        """
-        tail_words = self.buf.split()[-12:]
-        new_words = text.split()
-        top = min(len(tail_words), len(new_words))
-        for n in range(top, 1, -1):
-            if all(self._norm(a) == self._norm(b)
-                   for a, b in zip(tail_words[-n:], new_words[:n])):
-                return " ".join(new_words[n:])
-        return text
+        """Canonical form for word comparisons (exported for tests)."""
+        return word.strip().strip("\"'“”‘’()[]{}.,.!?;:…-_").lower()
 
     def _compose(self, core):
         if self.first or not self.prev_tail:
@@ -326,13 +298,7 @@ class SentenceAssembler:
 
     def add_chunk(self, text, t0, t1):
         """Feed one chunk's text; returns a list of (line, t0, t1) finals."""
-        text = self._collapse_repeats(self._trim_overlap(text.strip()))
-        # Cross-boundary single repeat: the buffer ends with a word the new
-        # chunk restates ("...directly from" + "from the speakers").
-        if text and self.buf:
-            buf_words = self.buf.split()
-            if buf_words and self._norm(buf_words[-1]) == self._norm(text.split()[0]):
-                text = " ".join(text.split()[1:])
+        text = text.strip()
         if not text:
             return []
         if self.buf:
@@ -371,6 +337,54 @@ class SentenceAssembler:
         return out
 
 
+def compose_live_line(assembler, unstable):
+    """Build the live (`draft`) line: pending block + unstable tail.
+
+    The block is every committed word in the current, not-yet-final line --
+    that is what makes the sentence grow in front of the user instead of
+    appearing a word at a time. The unstable tail (words the streamer has
+    heard but not yet had confirmed twice) is appended so the line ends
+    where the audio currently is, and those last words visibly settle as
+    the next passes agree with each other.
+
+    Showing committed text here is not duplication: `draft` is its own
+    display row, and the same text is carried into the `final` event when
+    the block fills. The live line is meant to preview that block.
+
+    Returns (text, t0).
+    """
+    base, t0 = assembler.draft()
+    tail = " ".join(w.text for w in unstable).strip()
+    if base and tail:
+        return base + " " + tail, t0
+    if tail:
+        # No committed block yet, so the tail carries its own start time.
+        return tail, unstable[0].start
+    return base, t0
+
+def plan_step(floor_secs, headroom, pass_hist):
+    """How much audio the next cycle may consume.
+
+    Sized from the *measured* cost of recent passes, not from a fixed number.
+    One pass over ~0.5s of real speech costs far more than a pass over 0.3s
+    (measured: 111 of 131 real passes exceeded 100ms, p90 ~590ms), so a fixed
+    small step cannot keep up -- every cycle overruns the audio it represents,
+    the queue grows, and caption lag increases without bound. That is the
+    accumulating-latency bug.
+
+    Consuming at least the pass cost is what holds drift at zero: the pipeline
+    then runs exactly as fast as the machine allows instead of accumulating
+    debt. p90 (not max) so a single slow spike does not inflate every later
+    step. `floor_secs` keeps the caller's minimum cadence.
+    """
+    if not pass_hist:
+        return floor_secs
+    ordered = sorted(pass_hist)
+    idx = min(len(ordered) - 1, max(0, int(round(0.9 * len(ordered))) - 1))
+    p90 = ordered[idx]
+    return max(floor_secs, p90 * headroom)
+
+
 def cmd_live(p, args):
     device = find_loopback(p, args.device_index)
     channels = int(device["maxInputChannels"])
@@ -383,13 +397,38 @@ def cmd_live(p, args):
 
     q = queue.Queue()
     stream = open_loopback_stream(p, device, frames, q)
+
+    step_secs = args.step_secs
+    assembler = SentenceAssembler(args.block_chars, args.chain_chars)
+
+    from streaming import RollingStreamer
+
+    streamer = RollingStreamer(
+        model,
+        language=args.language,
+        max_buf_secs=args.max_buf_secs,
+        pause_secs=args.pause_secs,
+        beam_size=args.beam_size,
+        prompt_chars=args.prompt_chars,
+        min_speech_secs=args.min_speech_secs,
+        gate_min_buf_secs=args.gate_min_buf_secs,
+        stall_passes=args.stall_passes,
+        vad_min_silence_ms=args.vad_min_silence_ms,
+        vad_pad_ms=args.vad_pad_ms,
+        no_speech_threshold=args.no_speech_threshold,
+        hallucination_silence_threshold=args.hallucination_silence_threshold,
+        compression_ratio_threshold=args.compression_ratio_threshold,
+        log_prob_threshold=args.log_prob_threshold,
+    )
+
     emit(
         {
             "type": "status",
             "msg": "live",
             "device": device["name"],
-            "chunk_secs": args.chunk_secs,
-            "overlap_secs": args.overlap_secs,
+            "step_secs": step_secs,
+            "block_chars": args.block_chars,
+            "beam_size": args.beam_size,
         }
     )
     log("Live transcription started — Ctrl+C to stop.")
@@ -410,69 +449,134 @@ def cmd_live(p, args):
 
     threading.Thread(target=watch_stdin, daemon=True).start()
 
-    assembler = SentenceAssembler(args.block_chars, args.chain_chars)
-    new_secs = args.chunk_secs - args.overlap_secs
-    new_bytes = int(bytes_per_sec * new_secs)
-    overlap_n = int(TARGET_RATE * args.overlap_secs)
-    tail = np.zeros(overlap_n, dtype=np.float32)
-    t_start = time.time()  # session wall clock, for line timestamps
     n_chunk = 0
-    try:
-        while not stop_event.is_set():
-            raw = collect_window(q, new_bytes, timeout=new_secs + 2.0,
-                                 stop_event=stop_event)
+    n_block = 0  # monotonic id for each committed block (for LLM correction)
+
+    def emit_final(line, lt0, lt1):
+        nonlocal n_block
+        n_block += 1
+        emit(
+            {
+                "type": "final",
+                "id": n_block,
+                "text": line,
+                "t0": round(lt0, 2),
+                "t1": round(lt1, 2),
+            }
+        )
+        # LLM correction (Phase C): hand only *completed* sentences to the
+        # worker. Enqueue and return — never block transcription on it.
+        if corrector is not None:
+            corrector.submit(n_block, line)
+
+    pass_hist = collections.deque(maxlen=12)
+    consumed = 0.0                 # seconds of audio taken from the device
+
+    def plan_step_secs():
+        return plan_step(args.step_secs, args.step_headroom, pass_hist)
+
+    def drop_backlog(excess):
+        """Discard `excess` seconds of audio from the oldest end.
+
+        The safety net under the adaptive step: if inference degrades (GPU
+        contention, thermal throttling) faster than the step can absorb, the
+        backlog is dropped rather than allowed to grow. Better to lose a
+        moment of audio than to fall permanently behind the speaker.
+        """
+        nonlocal consumed
+        if streamer.buf_secs >= excess:
+            streamer._cut(streamer.buf_t0 + excess)
+            consumed -= excess
+            return excess
+        excess -= streamer.buf_secs
+        streamer.buf_t0 += streamer.buf_secs
+        streamer.buf = np.zeros(0, dtype=np.float32)
+        want = int(excess * bytes_per_sec)
+        got = 0
+        while got < want:
+            try:
+                got += len(q.get_nowait())
+            except queue.Empty:
+                break
+        consumed -= got / bytes_per_sec
+        return got / bytes_per_sec
+
+    def collect_step(target_secs):
+        """Drain audio until `target_secs` of it has arrived.
+
+        A short read (idle loopback) is zero-padded, which is digital silence.
+        """
+        # Snap to whole frames. The adaptive planner returns a float, and
+        # int(bytes_per_sec * target) is often ODD -- ~15% of adaptive targets.
+        # An odd byte count then reaches np.frombuffer(dtype=int16) and raises
+        # "buffer size must be a multiple of element size", killing the backend
+        # after about a minute. A fixed step never produced odd counts, so this
+        # only ever appeared once the step became adaptive.
+        frame = frame_bytes_for(channels)
+        want = int(bytes_per_sec * target_secs)
+        want -= want % frame
+        if want <= 0:
+            want = frame
+        out = bytearray()
+        deadline = time.time() + target_secs + 2.0
+        while len(out) < want:
             if stop_event.is_set():
                 break
-            fresh = bytes_to_mono16k(raw, channels, rate)
-            if len(fresh) < len(tail):
-                fresh = np.pad(fresh, (0, len(tail) - len(fresh)))
-            else:
-                fresh = fresh[: int(TARGET_RATE * new_secs)]
-            window = np.concatenate([tail, fresh])
-            tail = window[-overlap_n:] if overlap_n else np.zeros(0, dtype=np.float32)
-            # Wall-clock session time: monotonic and drift-free (the old
-            # accumulated t_base could report 00:00 for late lines).
-            t0 = max(time.time() - t_start - args.chunk_secs, 0.0)
-            n_chunk += 1
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
+            try:
+                out.extend(q.get(timeout=min(remaining, 0.05)))
+            except queue.Empty:
+                continue
+        if len(out) < want:
+            out.extend(b"\x00" * (want - len(out)))
+        return bytes_to_mono16k(bytes(out), channels, rate)
 
-            peak = float(np.abs(window).max())
-            nbuf = len(assembler.buf)
+    corrector = None
+    if args.correct_model:
+        from correction import Corrector
+        corrector = Corrector(args.correct_model, args.correct_threads)
+        corrector.start()
+
+    try:
+        t_start = time.perf_counter()
+        while not stop_event.is_set():
+            target = plan_step_secs()
+            step = collect_step(target)
+            if stop_event.is_set():
+                break
+            n_chunk += 1
             clock = time.strftime("%H:%M:%S")
-            if peak < args.silence_threshold:
-                log("[%s chunk %d] silent (peak=%.4f, buf=%d), skipped"
-                    % (clock, n_chunk, peak, nbuf))
-            else:
-                log("[%s chunk %d] transcribing %.1fs (peak=%.3f, buf=%d)…"
-                    % (clock, n_chunk, len(window) / TARGET_RATE, peak, nbuf))
-                t_inf = time.time()
-                segments, _info = model.transcribe(
-                    window,
-                    language=args.language,
-                    beam_size=1,
-                    best_of=1,
-                    vad_filter=True,
-                    vad_parameters=dict(
-                        min_silence_duration_ms=args.vad_min_silence_ms,
-                        speech_pad_ms=args.vad_pad_ms,
-                    ),
-                    condition_on_previous_text=False,
-                )
-                log("[chunk %d] inference %.2fs" % (n_chunk, time.time() - t_inf))
-                segs = [s for s in segments if s.text.strip()]
-                if segs:
-                    chunk_text = " ".join(s.text.strip() for s in segs)
-                    ct0 = max(t0 + min(s.start for s in segs), 0.0)
-                    ct1 = max(t0 + max(s.end for s in segs), 0.0)
-                    for line, lt0, lt1 in assembler.add_chunk(chunk_text, ct0, ct1):
-                        emit(
-                            {
-                                "type": "final",
-                                "text": line,
-                                "t0": round(lt0, 2),
-                                "t1": round(lt1, 2),
-                            }
-                        )
-            dtext, dt0 = assembler.draft()
+
+            committed, unstable = streamer.feed(step)
+            if streamer.pass_secs:
+                pass_hist.append(streamer.pass_secs)
+
+            # Drift guard. `consumed` is how much audio has been taken from
+            # the device; wall time is how much should have arrived. Any
+            # difference is backlog sitting in the queue or the buffer, and
+            # it would otherwise become permanent caption lag.
+            consumed += len(step) / TARGET_RATE
+            behind = consumed - (time.perf_counter() - t_start)
+            if behind > args.max_backlog:
+                dropped = drop_backlog(behind - args.max_backlog)
+                log("[%s step %d] backlog %.2fs > %.2fs, dropped %.2fs"
+                    % (clock, n_chunk, behind, args.max_backlog, dropped))
+
+            log("[%s step %d] target %.2fs pass %.3fs buffer %.1fs "
+                "backlog %.2fs -> +%d committed, %d unstable"
+                % (clock, n_chunk, target, streamer.pass_secs,
+                   streamer.buf_secs, max(behind, 0.0),
+                   len(committed), len(unstable)))
+
+            if committed:
+                text = " ".join(w.text for w in committed)
+                ct0, ct1 = committed[0].start, committed[-1].end
+                for line, lt0, lt1 in assembler.add_chunk(text, ct0, ct1):
+                    emit_final(line, lt0, lt1)
+
+            dtext, dt0 = compose_live_line(assembler, unstable)
             emit({"type": "draft", "text": dtext, "t0": round(dt0, 2),
                   "n": n_chunk})
     except KeyboardInterrupt:
@@ -480,17 +584,21 @@ def cmd_live(p, args):
     finally:
         stream.stop_stream()
         stream.close()
+        # Recover words still waiting on agreement before the final flush.
+        try:
+            tail = streamer.flush()
+            if tail:
+                text = " ".join(w.text for w in tail)
+                for line, lt0, lt1 in assembler.add_chunk(text, tail[0].start,
+                                                          tail[-1].end):
+                    emit_final(line, lt0, lt1)
+        except Exception as exc:
+            log("streamer flush failed: %s" % exc)
         tail_final = assembler.flush()
         if tail_final is not None:
-            line, lt0, lt1 = tail_final
-            emit(
-                {
-                    "type": "final",
-                    "text": line,
-                    "t0": round(lt0, 2),
-                    "t1": round(lt1, 2),
-                }
-            )
+            emit_final(*tail_final)
+        if corrector is not None:
+            corrector.stop()
         emit({"type": "status", "msg": "stopped"})
 
 
@@ -507,16 +615,69 @@ def main():
     ap.add_argument("--model-dir", default=DEFAULT_MODEL_DIR)
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--compute-type", default="float16")
-    ap.add_argument("--chunk-secs", type=float, default=1.5)
-    ap.add_argument("--overlap-secs", type=float, default=0.2)
+    ap.add_argument("--step-secs", type=float, default=0.3,
+                    help="minimum audio per cycle. The effective step grows "
+                         "to match measured inference cost, because a pass "
+                         "over ~0.5s of speech costs far more than a pass "
+                         "over 0.3s; a fixed small step cannot keep up and "
+                         "caption lag grows without bound")
+    ap.add_argument("--step-headroom", type=float, default=1.25,
+                    help="multiply the p90 pass time by this to size each "
+                         "cycle, so consumption matches processing capacity")
+    ap.add_argument("--max-backlog", type=float, default=1.5,
+                    help="seconds of audio allowed to queue before the "
+                         "oldest is dropped. Safety net: bounds caption lag "
+                         "even if inference degrades beyond the adaptive "
+                         "step (GPU contention, thermal throttling)")
+    ap.add_argument("--max-buf-secs", type=float, default=12.0,
+                    help="buffer cap; exceeding it flushes the unstable tail. "
+                         "Keeps inference cost bounded on long monologue")
+    ap.add_argument("--pause-secs", type=float, default=0.2,
+                    help="trailing silence that counts as a pause and commits "
+                         "the tail. 0.2 measured best (WER 20.2%% on testclip); "
+                         "0 makes every pass flush, which is the old "
+                         "non-overlapping behaviour and scores 103%% WER")
+    ap.add_argument("--stall-passes", type=int, default=6,
+                    help="passes with no commit before force-flushing the "
+                         "tail. A prefix match that never agrees blocks ALL "
+                         "output, so this bounds the freeze")
+    ap.add_argument("--min-speech-secs", type=float, default=0.10,
+                    help="VAD gate: below this much speech in the buffer, "
+                         "skip the model entirely and discard any tail. This "
+                         "is what stops 'Thank you for watching' appearing "
+                         "over music")
+    ap.add_argument("--gate-min-buf-secs", type=float, default=0.9,
+                    help="only judge the VAD gate on a buffer at least this "
+                         "long, so short speech is never discarded")
+    ap.add_argument("--prompt-chars", type=int, default=0,
+                    help="committed characters fed back as initial_prompt "
+                         "(0 = off; carries vocabulary across flushes but "
+                         "risks hallucination)")
     ap.add_argument("--language", default="en")
-    ap.add_argument("--silence-threshold", type=float, default=0.005)
-    ap.add_argument("--block-chars", type=int, default=120,
+    ap.add_argument("--beam-size", type=int, default=5,
+                    help="beam width; 1 is greedy and cannot recover a bad "
+                         "early token")
+    ap.add_argument("--no-speech-threshold", type=float, default=0.6,
+                    help="above this no-speech probability, read silence as silence")
+    ap.add_argument("--hallucination-silence-threshold", type=float, default=2.0,
+                    help="seconds; drop short low-confidence segments in silence")
+    ap.add_argument("--compression-ratio-threshold", type=float, default=2.4,
+                    help="gzip ratio above which a segment counts as repetitive")
+    ap.add_argument("--log-prob-threshold", type=float, default=-1.0,
+                    help="minimum average token logprob for a segment to survive")
+    ap.add_argument("--block-chars", type=int, default=200,
                     help="sentence block size: emit a final per this many chars")
     ap.add_argument("--chain-chars", type=int, default=15,
                     help="trailing runes of the previous line chained into the next")
+    ap.add_argument("--correct-model", default="",
+                    help="path to a GGUF model; when set, each committed "
+                         "sentence is polished by an LLM on a worker thread")
+    ap.add_argument("--correct-threads", type=int, default=0,
+                    help="threads for the LLM (0 = auto). The backend sets "
+                         "OMP_NUM_THREADS=1 for resampling, so this must be set "
+                         "explicitly or the model runs single-threaded")
     ap.add_argument("--vad-min-silence-ms", type=int, default=150,
-                    help="Silero VAD silence needed to split (keep < chunk)")
+                    help="Silero VAD silence needed to split a segment")
     ap.add_argument("--vad-pad-ms", type=int, default=50,
                     help="Silero VAD padding around speech")
     args = ap.parse_args()
@@ -533,6 +694,10 @@ def main():
                 cmd_dump(p, args)
     except Exception as e:  # noqa: BLE001 — report as JSON, then exit nonzero
         emit({"type": "error", "msg": str(e)})
+        # Full traceback to stderr, which the Go frontend copies into
+        # .backend.log. A bare one-line message made a real crash
+        # ("buffer size must be a multiple of element size") undiagnosable.
+        traceback.print_exc()
         log("ERROR: %s" % e)
         sys.exit(2)
 
