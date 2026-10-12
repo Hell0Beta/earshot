@@ -49,8 +49,11 @@ npx @hell0beta/earshot
 - 🔒 **100% local** &mdash; Whisper runs on your own GPU via CUDA; no audio ever
   leaves the machine
 - ⚡ **Live line, not a slideshow** &mdash; the in-progress sentence grows word by
-  word as each window is transcribed, then commits into 120-character blocks.
-  The window is 1.5&nbsp;s, so you read roughly 0.75&nbsp;s behind the speaker.
+  word as you talk. Words are committed only once two consecutive passes agree
+  on them, so the live line self-corrects instead of duplicating. Committed text
+  lands in 200-character blocks. Typical lag is around **1&nbsp;s**, and the
+  step **adapts to your machine** rather than falling further behind &mdash; it
+  does not drift over a long session.
 - 🧩 **Sentence blocks, newest first** &mdash; readable chunks with a blank line
   separating the newest from the history, wrapped to your terminal width
 - 🎨 **Animated 5&times;5 splash** &mdash; a pixel-art `EARSHOT` banner with a
@@ -99,6 +102,33 @@ node bin/earshot.js
 Requirements: **Windows 10/11 x64**, Python 3.9+ on `PATH` (only for the one-time
 `setup`), and Node 14+ if you're using the npm wrapper.
 
+### Upgrading from 1.x
+
+2.0 replaced the capture engine, so several flags are **removed outright** and
+one changed meaning. Most people need no action &mdash; `earshot` on its own
+behaves correctly.
+
+| 1.x flag           | In 2.0                                                            |
+| ------------------ | ----------------------------------------------------------------- |
+| `--window-secs`    | **removed** &rarr; use `--step-secs`, which is now a *minimum*, not a fixed cadence |
+| `--context-secs`   | **removed** &mdash; there is no overlap to size anymore            |
+| `--recent-chars`   | **removed** &mdash; nothing to trim against                         |
+| `--chunk-secs`, `--overlap-secs` | **removed** (pre-1.3)                                  |
+
+New in 2.0, all optional and correctly defaulted:
+
+| Flag                    | Purpose                                                        |
+| ----------------------- | -------------------------------------------------------------- |
+| `--step-headroom`       | multiplier on measured pass time; raise if captions lag        |
+| `--max-backlog`         | seconds of audio allowed to queue before old audio is dropped  |
+| `--min-speech-secs`     | VAD gate &mdash; below this much speech, skip the model         |
+| `--gate-min-buf-secs`   | only judge the gate on a buffer at least this long             |
+| `--stall-passes`        | force-flush after N passes with no commit (bounds any stall)    |
+| `--max-buf-secs`, `--pause-secs` | buffer cap / pause commit threshold                      |
+
+If you keep a shortcut or script that passes `--window-secs`, it will now fail
+with an unknown-flag error &mdash; delete the argument.
+
 ---
 
 ## ⌨️ Keys
@@ -124,9 +154,17 @@ Requirements: **Windows 10/11 x64**, Python 3.9+ on `PATH` (only for the one-tim
 | `--model NAME`      | Whisper model (`small.en`, `base.en`, `medium.en`, `turbo`) | `small.en`         |
 | `--device WHAT`     | `auto`, `cuda` or `cpu`                                  | `auto`               |
 | `--compute-type T`  | CTranslate2 compute type                                 | auto per device      |
-| `--chunk-secs N`    | capture window length (also the worst-case caption lag)   | `1.5`                |
-| `--overlap-secs N`  | window overlap                                           | `0.2`                |
-| `--block-chars N`   | characters per committed sentence                        | `120`                |
+| `--step-secs N`     | *minimum* audio per cycle. The real step adapts to measured inference cost (see `--step-headroom`) | `0.3`         |
+| `--step-headroom N` | multiplier on the p90 pass time used to size each cycle. Raise if captions lag on a slow machine | `1.25`         |
+| `--max-backlog N`   | seconds of audio allowed to queue before the oldest is dropped. Caps caption lag | `1.5`           |
+| `--max-buf-secs N`  | rolling buffer cap before the unstable tail is flushed   | `12`               |
+| `--pause-secs N`    | trailing silence that counts as a pause and commits the tail | `0.2`          |
+| `--min-speech-secs N` | VAD gate: skip the model when the buffer has less speech than this. Stops "Thank you for watching" over music (lower = less aggressive) | `0.10` |
+| `--stall-passes N` | force-flush the tail after N passes with no commit. Bounds any stall | `6`              |
+| `--beam-size N`     | beam width (`1` = greedy, cannot recover a bad early token)      | `5`                  |
+| `--block-chars N`   | characters per committed sentence                                | `200`                |
+| `--correct-model F` | GGUF model path; each committed sentence is polished by an LLM   | off                  |
+| `--correct-threads` | threads for the correction model (`0` = auto)                    | `0`                  |
 | `--chain-chars N`   | trailing characters chained into the next block          | `15`                 |
 | `--out-dir DIR`     | where transcripts are written                            | `<data>/transcripts` |
 | `--keep N`          | transcript sessions to retain (`0` keeps none)           | `30`                 |
@@ -192,28 +230,34 @@ somewhere else.
 > environment and will still resolve the default. Open a new terminal, or set
 > `$env:EARSHOT_HOME` in the current one.
 
-### Choosing a window length and a model
+### Choosing a model
 
-Measured on a Quadro RTX 3000, scoring word precision against known speech
-(higher is better, `stutters` counts repeated word pairs):
+Scored as **word error rate against a real transcript** of known speech
+(the shipped `narrated-animations` sample clips), measured on a Quadro
+RTX 3000 &mdash; lower is better:
 
-| Model | Window | Precision | Stutters |
-| --------- | ------ | --------- | -------- |
-| `small.en` | 1.5s  | **0.93**  | 0        |
-| `medium.en`| 1.5s  | 0.91      | 0        |
-| `small.en` | 1.0s  | 0.86      | 0        |
-| `medium.en`| 1.0s  | 0.79      | 0        |
+| Model | `000-testclip` | `001_genesis-4` | Note |
+| ---------- | -------------- | --------------- | ----------------------------- |
+| `small.en` | **9.6%** | **32.4%** | default; fastest |
+| `medium.en` | &mdash; | 51.6% | worse **and** 2.8&times; slower |
 
-Two things worth knowing, because both are counter-intuitive:
+Three things worth knowing, all counter-intuitive:
 
-- **Window length matters more than model size.** A bigger model on a short
-  window is *worse*, not better &mdash; `medium.en` invents whole phrases
-  (`description`, `devices`, `video`) on half a second of audio, where
-  `small.en` on 1.5s does not.
-- **Precision, not recall, is the thing to watch.** Every config captured
-  100% of the reference words. Bad output is *extra* invented words, never
-  missing ones &mdash; so if captions look wrong, make the window longer
-  rather than reaching for a larger model.
+- **A bigger model is not a better model here.** `medium.en` scored worse than
+  `small.en` on the same audio *and* took 2.8&times; as long. On continuous
+  narration it filled gaps with conversational filler that was never spoken
+  (`"Bye!"`, `"Thank you"`). Bigger language models have stronger priors, and
+  on unbroken speech those priors invent content. Stick with `small.en`.
+- **If captions are wrong, it is usually a vocabulary problem, not a timing
+  one.** On the Bible-narration clip, ~20% of the reference words
+  (`abel`, `adam`, `eve`, `seth`, …) are never produced by *any* configuration
+  &mdash; the model simply does not know those names. No amount of tuning
+  recovers a word the decoder never emits.
+- **Everything here was scored against ground truth.** An earlier version of
+  this table compared Whisper against Whisper, which cannot detect a
+  Whisper-shaped error &mdash; it reported a 2.5&times; accuracy regression as
+  an improvement. If you change the transcription path, score it against a real
+  transcript too.
 
 On CPU, prefer `base.en`; `small.en` is slower than real time there.
 
@@ -242,10 +286,15 @@ speakers ──▶ WASAPI loopback ──▶ 16 kHz mono ──▶ VAD gate ─�
                      transcript file ◀── TUI ◀── JSON lines ◀───────┘
 ```
 
-The backend captures overlapping windows, drops the silent ones before they ever
-reach the GPU, and assembles the surviving text into fixed-size blocks
-character-driven rather than time-driven. Only complete blocks are committed; the
-partially-built sentence is streamed to the TUI as a live line.
+The backend keeps one rolling audio buffer and re-decodes it on a cycle sized
+from **measured** inference cost, so it consumes audio at exactly the rate your
+machine can transcribe it (a fixed step silently fell behind and made lag grow
+without bound). Silero VAD drops non-speech &mdash; music, room tone &mdash;
+*before* it reaches the GPU, which is what stops Whisper inventing "Thank you
+for watching" over a soundtrack. A word is committed only when two consecutive
+passes agree on it, so duplication is structurally impossible; assembled text is
+character-driven rather than time-driven, and the partially-built sentence
+streams to the TUI as a live line.
 
 Protocol, if you want to build on it: one JSON object per line on stdout
 &mdash; `status`, `draft`, `final`, `error`. All logging goes to stderr, and a
@@ -260,10 +309,17 @@ Protocol, if you want to build on it: one JSON object per line on stdout
 | Nothing appears, footer says `starting backend…` | The backend died. Read the `.backend.log` next to the transcript &mdash; it has the exact error. |
 | Nothing appears, says `○ backend down`     | Backend exited. `earshot doctor` will say which check failed.                        |
 | No captions but audio is playing           | Wrong capture device. `earshot doctor` &rarr; "audio capture device"; plug in headphones or pass `--device-index`. |
-| Captions lag behind the audio              | Lower `--chunk-secs` (e.g. `1.0`). Accuracy drops with it &mdash; 1.5s measured 0.93 precision vs 0.86 at 1.0s. |
-| Repeated or garbled words                  | Overlap too small for the model. Try `--overlap-secs 0.3`.  |
-| Whispers up extra words that were never said | Short windows make it confabulate. **Raise** `--chunk-secs`, do not lower it. |
-| Phantom phrases during silence             | Whisper hallucinating on noise. `--block-chars 200` and a larger model help.       |
+| Captions lag behind the audio              | The step adapts to your machine, so a steady lag means a pass is slower than the step allows. Raise `--step-headroom` (e.g. `1.6`), or lower `--max-backlog` to resync sooner. Latency grows over a session if the machine is too slow to keep up — check `.backend.log` for `backlog` readings. |
+| Latency keeps growing the longer you talk  | Should not happen: the step adapts and stale audio is dropped past `--max-backlog`. If it does, report it — it means a pass is slower than the drift guard assumes. |
+| Repeated or garbled words                  | Should be structurally impossible — only words two consecutive passes agree on are committed. If it happens, please report it. |
+| Duplicated phrases in the live line        | Should be structurally impossible. Usually two earshot instances sharing one audio device. |
+| Live line flickers / rewrites itself constantly | Block too short for the cadence — each commit is only a few passes wide | Raise `--block-chars` (200 → 400 roughly halves the churn) |
+| Committed line cut off mid-word | Display cap below the backend block size | `--block-chars` must stay under the frontend's `maxLineRunes` (320) |
+| Nothing appears for several seconds at start | Model load (~4s) plus the two-pass agreement dead zone. Normal, not a hang. |
+| Whispers up extra words that were never said | Raise `--pause-secs` slightly, or lower `--max-buf-secs` to bound long monologues. Confidence gating (`--no-speech-threshold` and friends) is the main guard. |
+| Accuracy poor on unusual vocabulary         | The model never decodes words it does not know — on the Genesis 4 clip 20.3% of reference words are absent from *every* pass (`abel`, `adam`, `eve`, `seth`, `zillah`…). No windowing change fixes this; it needs a better or domain-adapted model. |
+| Quiet speaker dropped entirely             | Should not happen (VAD-only gating). Check `.backend.log` for `no speech (peak=…)`. |
+| Phantom phrases during silence             | Whisper hallucinating on noise. Lower `--hallucination-silence-threshold` and `--no-speech-threshold`. |
 | `CUDA failed with error no CUDA-capable device` | GPU is asleep or held. See the note below.                                  |
 | Another earshot is already running         | **Only run one at a time** &mdash; two backends on one audio device will fight, and the second can wedge. |
 | The GPU vanished after a restart (Code 45) | A laptop power-gating quirk, not earshot. Cold boot on AC: `shutdown /s /t 0`, hold power 15s, boot plugged in. |

@@ -1,6 +1,6 @@
 {
   "name": "@hell0beta/earshot",
-  "version": "1.2.1",
+  "version": "2.0.0",
   "description": "Live, local captions for whatever your speakers are playing - WASAPI loopback + on-device Whisper, in your terminal",
   "publishConfig": {
     "access": "public"
@@ -31,7 +31,9 @@
     "backend/",
     "vendor/",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "!backend/*.m4a",
+    "!backend/*.mp4"
   ],
   "scripts": {
     "prepack": "node scripts/prepack.js",

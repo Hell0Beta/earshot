@@ -28,8 +28,9 @@ the UI layer).
 | Decision | Choice | Why |
 |---|---|---|
 | Default model | `small.en` | Best speed/accuracy balance on 6GB Quadro RTX 3000 (~2GB in float16, headroom left) |
-| Caption granularity | 0.5s sampler, 200-char sentence blocks | Live line grows ~2×/sec like AI streaming; commits on length only (first 200, then tail-15 + fresh); remainder flushes on stop |
-| Caption display | Bright live line + cursor over newest-first stack | In-progress sentence prominent on top; solid 200-char blocks below; transcript file keeps full chronological finals |
+| Caption granularity | 3.0s context window, 0.9s cadence, 120-char sentence blocks | Context and cadence are separate knobs — binding them forces a window long enough to help the model to also be a window long enough to delay every result. Commits on length only (first 120, then tail-15 + fresh); remainder flushes on stop |
+| Speech gating | Silero VAD only (`vad_filter=True`), plus Whisper's own confidence thresholds | A peak-amplitude gate reads quiet/compressed call audio as silence and drops real speech. `no_speech_threshold`/`hallucination_silence_threshold` handle silence instead |
+| Caption display | Bright live line + cursor, newest committed line sharing that style, over a dimmed newest-first stack | The finished sentence and the one being generated read as one block mid-sentence; older lines recede; transcript file keeps full chronological finals |
 | Pause semantics | UI-only pause | Go freezes display + stops saving; Python keeps running. No stdin control protocol, no audio-gap edge cases |
 | Model location | **`D:\earshot\models`** (canonical) | C: has ~3GB free; models + CUDA must live on D: (43GB free). Override via `--model-dir` / `EARSHOT_MODEL_DIR` |
 | Language | `en` fixed for v1 | `.en` models are smaller/faster; multilingual later |
