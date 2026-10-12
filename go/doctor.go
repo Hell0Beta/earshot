@@ -35,8 +35,14 @@ KEYS (while capturing)
 COMMON FLAGS
   --model NAME        whisper model (default small.en; base.en is faster on CPU)
   --device auto|cuda|cpu
-  --chunk-secs N      capture window (default 1.0)
-  --block-chars N     sentence block size (default 120)
+  --step-secs N      minimum audio per cycle; the step adapts to your
+                     machine's measured inference cost (default 0.3)
+  --step-headroom N  multiplier on the p90 pass time; raise if captions lag
+  --max-backlog N    seconds of audio allowed to queue before old audio is
+                     dropped, which bounds caption lag (default 1.5)
+  --beam-size N       beam width (default 5)
+  --block-chars N     sentence block size (default 200)
+  --correct-model F   GGUF model; polish each sentence with an LLM (off)
   --out-dir DIR       transcripts (default <data dir>/transcripts)
   --keep N            transcript sessions to retain (default 30)
   --splash-style shimmer|rainbow

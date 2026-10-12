@@ -77,6 +77,51 @@ func TestGapBetweenNewestAndHistory(t *testing.T) {
 	}
 }
 
+// TestNewestLineSharesLiveStyle covers the newest-line highlight *decision*.
+// lipgloss strips all styling when there's no TTY (colour profile Ascii), so
+// asserting on emitted escape codes would be meaningless here; the real
+// terminal picks up the style from the same branch this test exercises.
+func TestNewestLineSharesLiveStyle(t *testing.T) {
+	m := newTestModel(80, 20, []string{"- [00:03] newest", "- [00:02] older"})
+	m.draft = "live words"
+
+	// The newest line matches the live line, so the pair reads as one block.
+	if got, want := m.newestStyle().GetForeground(), liveLineStyle.GetForeground(); got != want {
+		t.Errorf("newest line colour = %v, want the live line colour %v", got, want)
+	}
+	if !m.newestStyle().GetBold() {
+		t.Error("newest line should be bold, matching the live line")
+	}
+	// Older history stays dimmed while live.
+	if m.historyStyle().GetForeground() == liveLineStyle.GetForeground() {
+		t.Error("history should be dimmed while live, not share the live colour")
+	}
+
+	// The highlight does not depend on a draft being present, so the display
+	// does not flicker between styles during a pause in speech.
+	m.draft = ""
+	if m.newestStyle().GetForeground() != liveLineStyle.GetForeground() {
+		t.Error("newest line should stay bright with no draft present")
+	}
+
+	// Pausing still restores full brightness across history.
+	m.paused = true
+	if m.historyDimmed() {
+		t.Error("history should not be dimmed while paused")
+	}
+
+	// Structure survives the style change, with and without a draft.
+	m.paused = false
+	body := stripANSI(m.renderContent())
+	if !strings.Contains(body, "newest") {
+		t.Errorf("render lost the newest line:\n%s", body)
+	}
+	m.draft = "live words"
+	if body := stripANSI(m.renderContent()); !strings.Contains(body, "live words") {
+		t.Errorf("render lost the live line:\n%s", body)
+	}
+}
+
 // TestHistoryDimDecision covers the dimming *decision*. lipgloss strips all
 // styling when there's no TTY (colour profile Ascii), so asserting on emitted
 // escape codes would be meaningless here; the real terminal picks up the style
@@ -96,6 +141,44 @@ func TestHistoryDimDecision(t *testing.T) {
 	body := stripANSI(m.renderContent())
 	if !strings.Contains(body, "committed") || !strings.Contains(body, "live words") {
 		t.Errorf("render lost content:\n%s", body)
+	}
+}
+
+// TestMaxLineRunesAboveBlockChars is the guard for the display cap. The
+// backend blocks to --block-chars (default 300); if maxLineRunes sits below
+// it, every committed line and every live draft is truncated mid-sentence.
+func TestMaxLineRunesAboveBlockChars(t *testing.T) {
+	const blockChars = 300
+	if maxLineRunes < blockChars {
+		t.Fatalf("maxLineRunes=%d is below block-chars=%d: every line would "+
+			"be truncated mid-sentence", maxLineRunes, blockChars)
+	}
+
+	// A full-size caption must survive the display path intact.
+	body := strings.Repeat("w ", blockChars/2)
+	m := newTestModel(200, 20, nil)
+	updated, _ := m.Update(captionMsg{Text: body, T0: 1})
+	got := updated.(model)
+	if len(got.lines) != 1 {
+		t.Fatalf("expected one committed line, got %d", len(got.lines))
+	}
+	if !strings.Contains(got.lines[0], strings.TrimSpace(body)) {
+		t.Errorf("a %d-char caption was truncated to %d chars:\n%s",
+			len(body), len(got.lines[0]), got.lines[0])
+	}
+
+	// The draft path is capped by the same constant, so check it too. The
+	// draft is word-wrapped to the viewport, so compare with the wrap points
+	// removed rather than searching the rendered text directly.
+	m.draft = body
+	draft := stripANSI(m.renderContent())
+	// Strip the ▌ cursor before comparing: it is appended to every wrapped
+	// row of the live line, so it interleaves with the text.
+	joined := strings.ReplaceAll(draft, "▌", "")
+	joined = strings.ReplaceAll(joined, "\n", " ")
+	if !strings.Contains(joined, strings.TrimSpace(body)) {
+		t.Errorf("live draft was truncated to %d chars:\n%s",
+			len(joined), draft)
 	}
 }
 

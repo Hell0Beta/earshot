@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -25,8 +26,16 @@ import (
 // ---- events from the backend reader goroutine ----
 
 type captionMsg struct {
+	ID   int
 	Text string
 	T0   float64
+}
+
+// correctedMsg patches an already-committed caption in place when the
+// backend's LLM correction pass returns a polished version.
+type correctedMsg struct {
+	ID   int
+	Text string
 }
 
 type draftMsg struct {
@@ -42,6 +51,7 @@ type tickMsg time.Time
 
 type backendEvent struct {
 	Type string  `json:"type"`
+	ID   int     `json:"id"`
 	Text string  `json:"text"`
 	Msg  string  `json:"msg"`
 	T0   float64 `json:"t0"`
@@ -61,9 +71,23 @@ var (
 	dimmedStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
 )
 
-const maxLineRunes = 200 // safety cap; the backend already blocks to this size
+// maxLineRunes is a safety cap only — the backend already blocks to
+// block_chars (default 300), and this must stay above it or every committed
+// line and live draft gets truncated mid-sentence.
+const maxLineRunes = 320
 
 // ---- model ----
+
+// archiveEntry locates one committed caption inside the transcript file so a
+// correction can rewrite its bytes in place. Captions are written in file
+// order (oldest first) while the on-screen stack is newest-first, so the two
+// are tracked separately.
+type archiveEntry struct {
+	id    int
+	pos   int64
+	bytes int
+	t0    float64
+}
 
 type model struct {
 	viewport    viewport.Model
@@ -85,6 +109,10 @@ type model struct {
 	build       string // exe build stamp (own mtime): "am I running the new one?"
 	outFile     *os.File
 	outPath     string
+	outPos      int64
+	lineIDs     []int     // block id per on-screen line (newest-first)
+	lineT0      []float64 // timestamp per on-screen line
+	archived    []archiveEntry
 }
 
 func (m model) Init() tea.Cmd { return tickCmd() }
@@ -119,6 +147,51 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		fmt.Fprintf(m.outFile, "- [%s] %s\n", fmtClock(msg.T0), msg.Text)
 		line := fmt.Sprintf("- [%s] %s", fmtClock(msg.T0), capRunes(msg.Text, maxLineRunes))
 		m.lines = append([]string{line}, m.lines...)
+		m.lineIDs = append([]int{msg.ID}, m.lineIDs...)
+		m.lineT0 = append([]float64{msg.T0}, m.lineT0...)
+		// Record the byte span this caption occupies so a later correction can
+		// rewrite it in place. Captions are written oldest-first, so the span
+		// is captured *after* the write above.
+		if end, err := m.outFile.Seek(0, io.SeekCurrent); err == nil {
+			entry := archiveEntry{id: msg.ID, t0: msg.T0}
+			entry.bytes = int(end - m.outPos)
+			entry.pos = m.outPos
+			m.archived = append(m.archived, entry)
+			m.outPos = end
+		}
+		m.refresh()
+		return m, nil
+
+	case correctedMsg:
+		if m.paused {
+			return m, nil
+		}
+		// Patch the displayed line if it is still on screen; corrections for
+		// lines that scrolled into history are ignored rather than popping
+		// them back into view.
+		for i, id := range m.lineIDs {
+			if id == msg.ID {
+				m.lines[i] = fmt.Sprintf("- [%s] %s",
+					fmtClock(m.lineT0[i]), capRunes(msg.Text, maxLineRunes))
+				break
+			}
+		}
+		// The archive stores the corrected text: what the reader sees is what
+		// is kept. Rewrite this block's bytes in place, padding with spaces
+		// so subsequent offsets stay valid.
+		for _, a := range m.archived {
+			if a.id != msg.ID {
+				continue
+			}
+			old := a.bytes
+			newText := fmt.Sprintf("- [%s] %s", fmtClock(a.t0), msg.Text)
+			if len(newText) > old {
+				newText = newText[:old]
+			}
+			padded := newText + strings.Repeat(" ", old-len(newText))
+			m.outFile.WriteAt([]byte(padded), a.pos)
+			break
+		}
 		m.refresh()
 		return m, nil
 
@@ -187,8 +260,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 // maxRenderedHistory caps how many older blocks are wrapped and drawn. Wrapping
 // is O(history x width) and runs on every draft event, so an unbounded stack
-// would eventually make the UI feel sluggish.
-const maxRenderedHistory = 40
+// would eventually make the UI feel sluggish. It scales with block size: at
+// block_chars=300 a 40-block stack is ~12k chars re-wrapped per event, so the
+// count is cut to keep the same screen-filling depth at a fraction of the cost.
+const maxRenderedHistory = 24
 
 // wrap hard-wraps text to the terminal width, preserving blank lines.
 func (m model) wrap(s string) string {
@@ -200,8 +275,9 @@ func (m model) wrap(s string) string {
 
 // renderContent builds the caption area: live line, newest block, a two-line
 // gap, then history packed tight — wrapped to the terminal width, pinned to the
-// top. While live, committed lines are dimmed so the in-progress line reads as
-// the hero; pausing restores full brightness for reading history.
+// top. The live line and the newest committed line share a style so the pair
+// reads as one block mid-sentence; older lines are dimmed so the in-progress
+// line reads as the hero. Pausing restores full brightness for reading history.
 func (m model) renderContent() string {
 	var parts []string
 	if m.draft != "" {
@@ -211,8 +287,11 @@ func (m model) renderContent() string {
 	}
 	style := m.historyStyle()
 	if len(m.lines) > 0 {
+		// The newest committed line shares the live line's style so the pair
+		// reads as one block while a sentence builds; the ▌ cursor is what
+		// tells them apart. Older lines fall back to the history style.
 		for _, ln := range strings.Split(m.wrap(m.lines[0]), "\n") {
-			parts = append(parts, style.Render(ln))
+			parts = append(parts, m.newestStyle().Render(ln))
 		}
 		if len(m.lines) > 1 {
 			// The gap sits between the new sentence and the block of old
@@ -237,13 +316,24 @@ func (m model) renderContent() string {
 // to full-brightness history for reading.
 func (m model) historyDimmed() bool { return !m.paused }
 
-// historyStyle is the style applied to committed lines.
+// historyStyle is the style applied to committed lines beyond the newest.
 func (m model) historyStyle() lipgloss.Style {
 	if m.historyDimmed() {
 		return dimmedStyle
 	}
 	return lipgloss.NewStyle()
 }
+
+// newestStyle is the style for the most recently committed line. It matches
+// the live line so the newest sentence and the one being generated read as a
+// single block; the cursor is what distinguishes them.
+//
+// Deliberately independent of `paused`: when paused the history style already
+// renders plain, so the highlight is a live-only cue and pausing still hands
+// the screen back for reading. Also independent of whether a draft is
+// present, so the display does not flicker between styles during a pause in
+// speech.
+func (m model) newestStyle() lipgloss.Style { return liveLineStyle }
 
 // headerHeight is the number of rows reserved above the caption area: title +
 // blank, plus the 5-row mini banner while paused.
@@ -387,7 +477,9 @@ func runBackendReader(prog *tea.Program, stdout *bufio.Reader) {
 		}
 		switch ev.Type {
 		case "final":
-			prog.Send(captionMsg{Text: ev.Text, T0: ev.T0})
+			prog.Send(captionMsg{ID: ev.ID, Text: ev.Text, T0: ev.T0})
+		case "corrected":
+			prog.Send(correctedMsg{ID: ev.ID, Text: ev.Text})
 		case "draft":
 			prog.Send(draftMsg{Text: ev.Text, Chunk: ev.N})
 		case "status":
@@ -397,6 +489,15 @@ func runBackendReader(prog *tea.Program, stdout *bufio.Reader) {
 		}
 	}
 	prog.Send(backendDoneMsg{Err: sc.Err()})
+}
+
+// correctionNote records in the transcript header whether the LLM pass ran,
+// so a transcript can be read knowing which text it holds.
+func correctionNote(model string) string {
+	if model == "" {
+		return ", correction off"
+	}
+	return ", correction on (" + filepath.Base(model) + ")"
 }
 
 func main() {
@@ -426,10 +527,16 @@ func main() {
 	hfCache := flag.String("hf-cache", "", "HF hub cache dir (default <data>/models/hf-hub)")
 	deviceFlag := flag.String("device", "auto", "inference device: auto, cuda or cpu")
 	computeFlag := flag.String("compute-type", "", "ctranslate2 compute type (auto)")
-	chunkSecs := flag.Float64("chunk-secs", 1.5, "capture window seconds")
-	overlapSecs := flag.Float64("overlap-secs", 0.2, "window overlap seconds")
-	blockChars := flag.Int("block-chars", 120, "sentence block size")
+	stepSecs := flag.Float64("step-secs", 0.3, "minimum audio per cycle; the effective step adapts to measured inference cost")
+	stepHeadroom := flag.Float64("step-headroom", 1.25, "multiplier on the p90 pass time used to size each cycle")
+	maxBacklog := flag.Float64("max-backlog", 1.5, "seconds of audio allowed to queue before the oldest is dropped")
+	maxBufSecs := flag.Float64("max-buf-secs", 12, "rolling buffer cap before the unstable tail is flushed")
+	pauseSecs := flag.Float64("pause-secs", 0.2, "trailing silence that counts as a pause and commits the tail")
+	beamSize := flag.Int("beam-size", 5, "beam width (1 = greedy, cannot recover a bad early token)")
+	blockChars := flag.Int("block-chars", 200, "sentence block size")
 	chainChars := flag.Int("chain-chars", 15, "trailing runes chained into next line")
+	correctModel := flag.String("correct-model", "", "path to a GGUF model; each committed sentence is polished by an LLM")
+	correctThreads := flag.Int("correct-threads", 0, "threads for the correction model (0 = auto)")
 	outDir := flag.String("out-dir", "", "transcript output dir (default <data>/transcripts)")
 	keep := flag.Int("keep", 30, "max transcript sessions to retain (0 = keep none)")
 	noPrune := flag.Bool("no-prune", false, "never delete old transcripts")
@@ -478,6 +585,15 @@ func main() {
 			fmt.Printf("pruned %d old transcript(s), keeping %d\n", n, *keep)
 		}
 	}
+	if *stepSecs <= 0 {
+		fmt.Fprintf(os.Stderr, "--step-secs must be positive (got %.2f)\n", *stepSecs)
+		os.Exit(2)
+	}
+	if *maxBufSecs < *stepSecs {
+		fmt.Fprintf(os.Stderr, "--max-buf-secs must be >= --step-secs (got %.2f < %.2f)\n", *maxBufSecs, *stepSecs)
+		os.Exit(2)
+	}
+
 	stamp := time.Now().Format("2006-01-02_1504")
 	outPath := filepath.Join(transcripts, stamp+".md")
 	f, err := os.Create(outPath)
@@ -486,17 +602,28 @@ func main() {
 		os.Exit(1)
 	}
 	build := buildStamp()
-	fmt.Fprintf(f, "# Earshot %s (build %s)\n\nmodel: %s (%s/%s), chunk %.1fs, overlap %.1fs, block %d+%d\n\n",
+	// Captions are appended after the header; corrections rewrite byte spans
+	// in place, so seed the running offset past the header.
+	headerPos, _ := f.Seek(0, io.SeekCurrent)
+	fmt.Fprintf(f, "# Earshot %s (build %s)\n\nmodel: %s (%s/%s), step %.2fs, buffer cap %.1fs, beam %d, block %d+%d%s\n\n",
 		time.Now().Format("2006-01-02 15:04"), build, *modelName, device, compute,
-		*chunkSecs, *overlapSecs, *blockChars, *chainChars)
+		*stepSecs, *maxBufSecs, *beamSize, *blockChars, *chainChars, correctionNote(*correctModel))
 
 	cmd := exec.Command(py.Path, "-u", be.Path, "--live",
 		"--model", *modelName, "--model-dir", models,
 		"--device", device, "--compute-type", compute,
-		"--chunk-secs", fmt.Sprint(*chunkSecs),
-		"--overlap-secs", fmt.Sprint(*overlapSecs),
+		"--step-secs", fmt.Sprint(*stepSecs),
+		"--step-headroom", fmt.Sprint(*stepHeadroom),
+		"--max-backlog", fmt.Sprint(*maxBacklog),
+		"--max-buf-secs", fmt.Sprint(*maxBufSecs),
+		"--pause-secs", fmt.Sprint(*pauseSecs),
+		"--beam-size", fmt.Sprint(*beamSize),
 		"--block-chars", fmt.Sprint(*blockChars),
 		"--chain-chars", fmt.Sprint(*chainChars))
+	if *correctModel != "" {
+		cmd.Args = append(cmd.Args, "--correct-model", *correctModel,
+			"--correct-threads", fmt.Sprint(*correctThreads))
+	}
 	env := os.Environ()
 	// Only touch PATH when we actually have a directory to add; if the CUDA
 	// DLLs are already on PATH, leave it alone.
@@ -537,6 +664,7 @@ func main() {
 		started:     time.Now(),
 		build:       build,
 		blockChars:  *blockChars,
+		outPos:      headerPos,
 		splashStyle: *splashStyle,
 		outFile:     f,
 		outPath:     outPath,
