@@ -365,6 +365,167 @@ Also fixed: the top-level handler printed only `str(e)`, which is why the
 crash had no traceback. It now prints a full `traceback.print_exc()` to
 stderr, which the Go frontend copies into `.backend.log`.
 
+## The adaptive-step runaway
+
+Symptom: captions froze for many seconds, then a wall of text arrived at once.
+It looked like the stable-prefix deadlock, but the log said otherwise
+(`2026-10-13_0716.backend.log`):
+
+```
+target : median 0.98s   p90 4.30s   MAX 19.52s
+pass   : median 0.73s   p90 1.32s   MAX 18.32s
+BURSTS (>=20 words in one commit): 3   (+30, +34, +44 words)
+RUNAWAY steps (target>3s): 15 of 128 (12%)
+```
+
+This was a **positive feedback loop, not a deadlock**:
+
+1. one pass took 18.32s (GPU contention — the same machine was also playing
+   audio through the loopback device);
+2. `plan_step` sized the next cycle from `p90 * headroom` = **16.77s**;
+3. that cycle waited 16.8s to gather audio, so the display froze;
+4. the buffer hit its 12s cap and flushed **44 words** at once;
+5. the step climbed again, to **19.52s**.
+
+`plan_step` had no ceiling, so one transient slow pass could ratchet the step
+without bound — and the p90 was the worst possible estimator, because a single
+outlier sits above the 90th percentile of a 12-sample window.
+
+Fix: estimate from the **median** (unmoved by one outlier) and clamp the result
+to `--max-step-secs` (default 2.5s).
+
+## Four defects behind the stall reports
+
+All four were real and independent; none was a tuning problem.
+
+1. **`plan_step` runaway** (above).
+2. **The watchdog could never fire on an empty hypothesis.** `update` set
+   `self.prev = new[n:]` before testing `elif self.prev`, so when `_fresh()`
+   filtered a hypothesis down to nothing, the pending tail was cleared *and*
+   `stalled` stopped incrementing. The progress guarantee silently evaporated.
+   An empty hypothesis is now treated as absence of evidence: the tail is kept
+   and the pass still counts as a stall.
+3. **`pass_secs` went stale whenever the VAD gate skipped.** The gate returned
+   before `_transcribe`, leaving the previous pass's cost in place — logged as a
+   constant (`pass 0.791s` in `2026-10-12_0854.backend.log`) and fed to the step
+   planner as if it were fresh.
+4. **The session-end flush dropped the tail.** `flush()` with `< 0.1s` of audio
+   called `sp.flush([])`, which commits nothing and clears `prev` — the "last
+   few words go missing" bug. It now returns the pending tail verbatim.
+
+## Resync: resolving a head word that never settles
+
+The prefix rule commits only while consecutive hypotheses agree, so one
+wandering head word blocks every commit behind it (the watchdog then
+force-commits text that never agreed — a freeze traded for garbage).
+
+Resync: after `resync_passes` consecutive disagreements, if the model has
+stopped emitting the head word **anywhere** in the hypothesis, it is treated as
+falsified and skipped (bounded to offsets 1–2). The words that still agree
+behind it are committed normally; nothing unagreed is ever committed.
+
+A word that is still being emitted is never dropped, however long it disagrees —
+that is what keeps a merely slow-but-real word safe.
+
+## Per-word latency telemetry
+
+`--latency-csv PATH` writes one row per committed word (`wall, cycle, event,
+word, audio_end_s, latency_s, pass_s, target_s, buffer_s`) plus event rows for
+cycles that committed nothing (`gate`, `watchdog`, `resync`, `cap`, `empty`), so
+a gap in the data is explainable. The Go frontend writes
+`<stamp>.latency.csv` beside the transcript and prunes it with the session.
+
+Latency is derived from the **audio timeline** — when the word's audio arrived
+versus when it was committed — not from a timed call, so it is immune to the
+lazy-generator gotcha that made `pass_secs` lie. A session-end summary
+(median/p90/max) goes to `.backend.log`.
+
+## Resync cost, measured
+
+Same audio, same model, matched 120s reference (SRT cues starting under 120s):
+
+| variant | WER | hyp words | survival | resyncs |
+|---|---|---|---|---|
+| resync on | 47.8% | 308 | 62.3% | 5 |
+| resync off | 45.5% | 315 | 65.0% | 0 |
+
+Resync costs ~2 WER points / ~7 words per 120s — the accepted risk of dropping a
+reworded head. Both figures sit far from the 32.4% recorded earlier for this
+same configuration, so the **absolute** baseline is not reproducing today
+(possible causes: machine load during measurement, or drift the earlier record
+does not capture). That discrepancy is tracked separately; the resync decision
+rests on the *relative* A/B, which is measured back-to-back and therefore
+unaffected by load.
+
+## The freezes were Whisper's temperature fallback
+
+Symptom: the display froze for several seconds, then resumed. It looked like the
+streamer stalling again, but the log ruled that out -- the gap between log lines
+minus the logged `pass` time never exceeded 1.0s (median 0.00), so *all* the
+stall was inside `model.transcribe()`.
+
+It was also not buffer size:
+
+```
+step 122  pause  pass 12.895s  buffer 0.0s  ->  +2 committed
+step 121  none   pass  0.491s  buffer 0.7s
+```
+
+The 12.9s pass decoded ~1.4s of audio. Slow passes clustered on `pause`/`commit`
+(buffers ending in silence) and on `empty` (the model returned *nothing*, yet
+took 4-5s). That is the signature of **temperature fallback**: when a segment
+fails `compression_ratio` / `log_prob` / `no_speech`, faster-whisper re-decodes
+it at temperatures 0.0 through 1.0 -- up to **six full beam searches**.
+
+A/B on 150s of narration, model loaded once, matched reference:
+
+| `--temp-fallback` | WER | survival | slow passes ≥1.5s | total stall | wall |
+|---|---|---|---|---|---|
+| `full` (previous default) | 45.1% | 65.6% | 55 | 220.8s | 531s |
+| `short` (`[0,.2,.4]`) | 44.6% | 64.8% | 27 | 60.7s | 311s |
+| `off` (`temperature=0`) | 44.9% | 65.1% | 1 | 4.8s | 223s |
+
+Accuracy is identical within the noise floor of this metric (±15 points). `off`
+removes 54 of 55 freezes, 216s of stall, and runs 2.4× faster. `full` also
+emitted a "Thank you for watching" hallucination that `off` and `short` did not
+-- consistent with the earlier finding that fallback recovers *less* than it
+costs here. **`off` is now the default**; `short` and `full` remain available.
+
+One ~4.8s pass survives under `off`, cause unknown. Rare, and now visible.
+
+Caveat: the three policies were measured sequentially (`full` first), so a
+warm-up effect could inflate `full` slightly. It cannot account for a 44×
+difference in stall time, and the earlier independent A/B reproduced it.
+
+## Why this hid for so long
+
+The step log printed `buffer` **after** `_cut`, so every flush showed
+`buffer 0.0s` -- a 12.9s pass over 1.4s of audio read as a pass over nothing.
+The streamer's own state was fine the whole time, so the streamer's own logs
+said the streamer was fine.
+
+Two telemetry fixes:
+
+- `pass_buf_secs` records the buffer the pass actually decoded, and the log
+  prints that.
+- `SLOWPASS` marks any decode at or above `--slow-pass-secs` (default 1.5s),
+  including whether it produced no words at all -- the cheapest possible signal
+  that a pass was pure waste.
+
+The one-shot `faulthandler` 120s thread dump was removed: it fired mid-session
+and printed only idle threads.
+
+## Session audio, so a stall can be replayed
+
+A live session previously left no audio, so a reported freeze could only be
+argued about. `--dump-audio` now writes the captured mono 16 kHz audio
+(zero-padded where `collect_step` padded, keeping it aligned with session time),
+and the frontend stores `<stamp>.audio.wav` beside the transcript.
+
+Retention is deliberately far tighter than transcripts: **the newest 5** sessions
+are kept, and each session past the 5th evicts the oldest. Audio is the largest
+artifact by an order of magnitude and exists only to replay recent stalls.
+
 ## The metrics lesson
 
 Every metric used during the sliding-window work compared **Whisper's output

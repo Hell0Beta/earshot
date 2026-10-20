@@ -110,22 +110,65 @@ class WanderingModel:
         return [NS(words=ws)], None
 
 
-def test_watchdog_bounds_a_stuck_prefix():
-    """A head word that never agrees must not freeze output forever.
+def test_resync_resolves_a_wandering_head():
+    """A reworded head must not block the words that still agree behind it.
 
-    The prefix rule only commits while consecutive hypotheses agree, so a
-    wandering head would otherwise block every commit until the buffer cap
-    (12s of frozen captions). The watchdog bounds that to `stall_passes`.
+    Resync fires only after `resync_passes` consecutive disagreements *and*
+    when the model has stopped saying the head word at all -- the evidence
+    that it was a hallucination or a reword. The stable suffix then commits.
     """
     m = WanderingModel()
-    rs = make(m, min_secs=0.1, pause_secs=99, max_buf_secs=999, stall_passes=3)
+    rs = make(m, min_secs=0.1, pause_secs=99, max_buf_secs=999,
+              stall_passes=6, resync_passes=2)
     rs._speech_secs = _Vad(99.0)
     outs = [rs.feed(np.zeros(16000, dtype=np.float32))[0] for _ in range(3)]
-    assert outs == [[], [], []], outs      # agreeing is still required
+    assert outs[0] == [] and outs[1] == [], outs
+    assert txt(outs[2]) == "you", outs
+    assert rs.sp.resyncs == 1, "resync should have fired exactly once"
+    committed_text = " ".join(txt(o) for o in outs)
+    assert "Thank" not in committed_text and "Thanks" not in committed_text, \
+        "nothing unagreed may be committed"
+
+
+def test_resync_does_not_fire_while_the_head_is_still_said():
+    """A slow-but-real head word must never be dropped.
+
+    The model keeps emitting it, so it has not been falsified -- resync must
+    leave it alone even after many disagreeing passes.
+    """
+    sp = StablePrefix(resync_passes=1)
+    assert sp.update([W("um", 0, .2), I]) == []
+    # Head disagrees, but "um" is still present later in the hypothesis.
+    assert sp.update([W("uh", 0, .2), W("um", .2, .4), I]) == []
+    assert sp.resyncs == 0
+    assert txt(sp.unstable) == "uh um i", txt(sp.unstable)
+
+
+class SingleWordWander:
+    """Every hypothesis is one word, so no offset can agree: watchdog only."""
+
+    def __init__(self):
+        self.calls = 0
+
+    def transcribe(self, audio, **kw):
+        self.calls += 1
+        word = " Thanks" if self.calls % 2 else " Thank"
+        return [NS(words=[NS(word=word, start=0.0, end=1.0)])], None
+
+
+def test_watchdog_bounds_a_stuck_prefix_when_resync_cannot_agree():
+    """If no offset agrees at all, the watchdog is the last-resort bound."""
+    m = SingleWordWander()
+    rs = make(m, min_secs=0.1, pause_secs=99, max_buf_secs=999,
+              stall_passes=3, resync_passes=99)
+    rs._speech_secs = _Vad(99.0)
+    outs = [rs.feed(np.zeros(16000, dtype=np.float32))[0] for _ in range(4)]
+    assert outs == [[], [], [], []], outs       # agreeing is still required
     assert rs.buf_t0 == 0.0, "buffer must not advance while stalled"
-    c, _u = rs.feed(np.zeros(16000, dtype=np.float32))    # 4th -> watchdog
+    c, _u = rs.feed(np.zeros(16000, dtype=np.float32))    # 5th -> watchdog
     assert c, "watchdog must force progress instead of stalling to the cap"
-    assert txt(c) == "Thank you", txt(c)
+    assert txt(c) in ("Thanks", "Thank"), txt(c)
+
 
 
 # ---- StablePrefix ----
@@ -195,10 +238,13 @@ class FakeModel:
         self.calls = 0
         self.prompts = []
         self.buf_lens = []
+        self.kw = {}
         self._words = words
 
     def transcribe(self, audio, **kw):
         self.calls += 1
+        self.kw = kw
+
         self.prompts.append(kw.get("initial_prompt"))
         self.buf_lens.append(len(audio) / 16000.0)
         end = min(self.visible, len(audio) / 16000.0)
@@ -468,6 +514,145 @@ def test_adaptive_targets_are_frame_aligned_end_to_end():
         want = int(bps * target)
         want -= want % frame
         assert want % frame == 0, target
+
+
+def test_plan_step_is_not_ratcheted_by_one_slow_pass():
+    """One 18s outlier must not inflate the step -- the runaway bug.
+
+    Measured: a single 18.32s pass (GPU contention) drove p90*headroom to
+    16.77s and then 19.52s, freezing captions and flushing a 44-word burst.
+    A median ignores the outlier; the ceiling bounds it outright.
+    """
+    hist = collections.deque([0.7] * 11 + [18.32], maxlen=12)
+    step = plan_step(0.3, 1.25, hist, 2.5)
+    assert step < 1.0, "median must ignore a single slow pass: %.2f" % step
+
+
+def test_plan_step_respects_the_ceiling():
+    """Even a genuinely slow machine cannot push the step past the ceiling."""
+    hist = collections.deque([18.0] * 12, maxlen=12)
+    assert plan_step(0.3, 1.25, hist, 2.5) == 2.5
+
+
+def test_empty_fresh_set_does_not_clear_the_tail_or_freeze_the_watchdog():
+    """An empty hypothesis is absence of evidence, not evidence of progress.
+
+    Clearing `prev` here both lost the pending words and froze `stalled`
+    (which was only incremented while `prev` was non-empty), so the watchdog
+    could never fire. That is the genuine deadlock class.
+    """
+    sp = StablePrefix()
+    sp.update([I, WANT])
+    assert txt(sp.update([I, WANT, TO])) == "i want"
+    assert txt(sp.unstable) == "to"
+    # Every word in this hypothesis is behind the commit point -> fresh empty.
+    assert sp.update([I, WANT]) == []
+    assert txt(sp.unstable) == "to", "the pending tail must survive"
+    assert sp.stalled == 1, "an empty pass must still count as a stall"
+
+
+def test_session_end_flush_keeps_the_pending_tail():
+    """Quitting with < 0.1s buffered used to throw the last words away."""
+    rs = make(FakeModel(), min_secs=0.1)
+    rs.sp.prev = [I, WANT]
+    rs.buf = np.zeros(0, dtype=np.float32)
+    assert txt(rs.flush()) == "i want"
+
+
+def test_word_latency_is_measured_from_audio_arrival():
+    """Latency is spoken->committed, derived from the audio timeline."""
+    rs = make(FakeModel(), min_secs=0.1)
+    rs._arrival_abs = 10.0      # newest buffered audio ends at 10s
+    rs._arrival_perf = 100.0    # ...and arrived at perf_counter 100
+    w = W("x", 8.0, 9.0)        # ended at 9s -> arrived 1s earlier
+    assert abs(rs.word_latency(w, now=100.5) - 1.5) < 1e-9
+
+
+def test_pass_secs_resets_when_the_gate_skips():
+    """A skipped pass must not report the previous pass's cost.
+
+    The stale value printed as a constant `pass 0.791s` in the log and was
+    fed to the step planner as if it were a fresh measurement.
+    """
+    m = FakeModel()
+    rs = make(m, min_speech_secs=0.10)
+    rs._speech_secs = _Vad(1.0)
+    rs.feed(np.zeros(16000, dtype=np.float32))   # a real pass sets pass_secs
+    rs._speech_secs = _Vad(0.0)
+    rs.feed(np.zeros(16000, dtype=np.float32))   # gate skips the model
+    assert rs.pass_secs == 0.0, rs.pass_secs
+    assert rs.last_event == "gate", rs.last_event
+
+
+def test_pass_buf_secs_records_the_audio_the_pass_decoded():
+    """The buffer logged by the caller is post-`_cut`; this is the real one.
+
+    On a pause flush the buffer is cut to zero *after* the pass, so the log
+    showed `buffer 0.0s` for a 12.9s pass over ~1.4s of audio and hid the
+    temperature-fallback stalls.
+    """
+    m = FakeModel()
+    rs = make(m, min_secs=0.1, pause_secs=99)
+    rs._speech_secs = _Vad(99.0)
+    rs.feed(np.zeros(32000, dtype=np.float32))
+    assert rs.pass_buf_secs >= 1.9, rs.pass_buf_secs
+    assert rs.buf_secs >= 1.9
+    # A pause flush cuts the buffer to nothing, but the pass still decoded it.
+    rs.pause_secs = 0.01
+    rs.feed(np.zeros(16000, dtype=np.float32))
+    assert rs.buf_secs == 0.0
+    assert rs.pass_buf_secs >= 1.0, rs.pass_buf_secs
+
+
+def test_temperature_policy_reaches_the_model():
+    """`off` must pass temperature=0.0; `full` must not pass it at all."""
+    for policy, expected in ((None, "absent"), (0.0, 0.0),
+                             ([0.0, 0.2, 0.4], [0.0, 0.2, 0.4])):
+        m = FakeModel()
+        rs = make(m, min_secs=0.1, temperature=policy)
+        rs._speech_secs = _Vad(99.0)
+        rs.feed(np.zeros(16000, dtype=np.float32))
+        got = m.kw.get("temperature", "absent")
+        assert got == expected, (policy, got)
+
+
+def test_pass_empty_flags_a_decode_that_produced_nothing():
+    """A slow pass that yields no words is pure waste; it must be visible."""
+    class Silent(FakeModel):
+        def transcribe(self, audio, **kw):
+            self.calls += 1
+            self.kw = kw
+            return [], None
+
+    rs = make(Silent(), min_secs=0.1)
+    rs._speech_secs = _Vad(99.0)
+    rs.feed(np.zeros(16000, dtype=np.float32))
+    assert rs.pass_empty is True
+
+
+def test_audio_writer_round_trips_mono16k():
+    """The dump must be readable back at 16 kHz with the same length."""
+    import tempfile
+    import wave as wavemod
+    from captions import AudioWriter
+
+    path = os.path.join(tempfile.mkdtemp(), "dump.wav")
+    aw = AudioWriter(path)
+    aw.add(np.sin(np.linspace(0, 20, 16000)).astype(np.float32) * 0.5)
+    aw.add(np.zeros(8000, dtype=np.float32))
+    aw.close()
+    with wavemod.open(path, "rb") as w:
+        assert w.getframerate() == TARGET_RATE
+        assert w.getnchannels() == 1
+        assert w.getnframes() == 24000, w.getnframes()
+
+
+def test_audio_writer_is_a_noop_when_disabled():
+    from captions import AudioWriter
+
+    aw = AudioWriter("")
+    aw.add(np.zeros(100, dtype=np.float32))   # must not raise
+    aw.close()
 
 
 if __name__ == "__main__":

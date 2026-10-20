@@ -160,3 +160,92 @@ func TestPruneMissingDir(t *testing.T) {
 		t.Errorf("expected an error for a missing directory")
 	}
 }
+
+// seedAudio creates n fake recordings in dir.
+func seedAudio(t *testing.T, dir string, n int) {
+	t.Helper()
+	for i := 1; i <= n; i++ {
+		stem := fmt.Sprintf("2026-09-%02d_%04d", (i%28)+1, i*7)
+		write(t, filepath.Join(dir, stem+audioSuffix), "RIFF....")
+	}
+}
+
+func countAudio(t *testing.T, dir string) int {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("readdir: %v", err)
+	}
+	n := 0
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), audioSuffix) {
+			n++
+		}
+	}
+	return n
+}
+
+// The requested retention: keep 5, and every session past the 5th evicts the
+// oldest. Audio is pruned far harder than transcripts.
+func TestPruneAudioKeepsNewestFive(t *testing.T) {
+	dir := t.TempDir()
+	seedAudio(t, dir, 8)
+
+	removed, err := pruneAudio(dir, audioKeep)
+	if err != nil {
+		t.Fatalf("pruneAudio: %v", err)
+	}
+	if removed != 3 {
+		t.Errorf("removed = %d, want 3", removed)
+	}
+	if got := countAudio(t, dir); got != 5 {
+		t.Errorf("recordings left = %d, want 5", got)
+	}
+}
+
+// Audio whose transcript was already pruned must still be evicted, or the
+// directory leaks the largest files forever.
+func TestPruneAudioDoesNotNeedAPairedTranscript(t *testing.T) {
+	dir := t.TempDir()
+	seedAudio(t, dir, 6) // no .md files at all
+
+	removed, err := pruneAudio(dir, audioKeep)
+	if err != nil {
+		t.Fatalf("pruneAudio: %v", err)
+	}
+	if removed != 1 {
+		t.Errorf("removed = %d, want 1", removed)
+	}
+	if got := countAudio(t, dir); got != 5 {
+		t.Errorf("recordings left = %d, want 5", got)
+	}
+}
+
+// Only files matching the app's own stamp are touched; anything else is safe.
+func TestPruneAudioIgnoresForeignFiles(t *testing.T) {
+	dir := t.TempDir()
+	seedAudio(t, dir, 6)
+	write(t, filepath.Join(dir, "notes.audio.wav"), "keep me\n")
+
+	if _, err := pruneAudio(dir, audioKeep); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "notes.audio.wav")); err != nil {
+		t.Errorf("foreign file was deleted")
+	}
+}
+
+func TestPruneAudioIsIdempotent(t *testing.T) {
+	dir := t.TempDir()
+	seedAudio(t, dir, 9)
+	if _, err := pruneAudio(dir, audioKeep); err != nil {
+		t.Fatal(err)
+	}
+	n, err := pruneAudio(dir, audioKeep)
+	if err != nil || n != 0 {
+		t.Errorf("second prune: removed=%d err=%v", n, err)
+	}
+	if got := countAudio(t, dir); got != 5 {
+		t.Errorf("recordings left = %d, want 5", got)
+	}
+}

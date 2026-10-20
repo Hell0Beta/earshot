@@ -37,7 +37,14 @@ COMMON FLAGS
   --device auto|cuda|cpu
   --step-secs N      minimum audio per cycle; the step adapts to your
                      machine's measured inference cost (default 0.3)
-  --step-headroom N  multiplier on the p90 pass time; raise if captions lag
+  --step-headroom N  multiplier on the median pass time; raise if captions lag
+  --max-step-secs N  hard ceiling on the adaptive step (default 2.5), so one
+                     slow pass cannot freeze the display
+  --temp-fallback M  off (default), short or full. A segment that fails
+                     Whisper's confidence checks is otherwise re-decoded at up
+                     to six temperatures, which is what freezes the display
+  --save-audio       keep the newest 5 sessions' audio so a stall can be
+                     replayed (default on; --save-audio=false to disable)
   --max-backlog N    seconds of audio allowed to queue before old audio is
                      dropped, which bounds caption lag (default 1.5)
   --beam-size N       beam width (default 5)

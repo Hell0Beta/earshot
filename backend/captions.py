@@ -13,7 +13,7 @@ Protocol discipline:
 
 import argparse
 import collections
-import faulthandler
+import csv
 import json
 import math
 import os
@@ -362,7 +362,7 @@ def compose_live_line(assembler, unstable):
         return tail, unstable[0].start
     return base, t0
 
-def plan_step(floor_secs, headroom, pass_hist):
+def plan_step(floor_secs, headroom, pass_hist, max_step_secs=None):
     """How much audio the next cycle may consume.
 
     Sized from the *measured* cost of recent passes, not from a fixed number.
@@ -372,17 +372,133 @@ def plan_step(floor_secs, headroom, pass_hist):
     the queue grows, and caption lag increases without bound. That is the
     accumulating-latency bug.
 
-    Consuming at least the pass cost is what holds drift at zero: the pipeline
-    then runs exactly as fast as the machine allows instead of accumulating
-    debt. p90 (not max) so a single slow spike does not inflate every later
-    step. `floor_secs` keeps the caller's minimum cadence.
+    The estimator is the **median**, not the p90. p90 was chosen to avoid a
+    slow spike inflating every later step, but it does the opposite when the
+    history is short: one 18s pass (GPU contention) sits above the 90th
+    percentile of a 12-sample window, so `p90 * headroom` jumped to 16.8s and
+    then 19.5s. The step then waited that long before decoding, which froze the
+    captions and produced a 44-word burst when the buffer cap finally flushed.
+    A median is unmoved by one outlier.
+
+    `max_step_secs` is a hard ceiling so no estimator can ever recreate that
+    runaway; a step larger than the buffer is pointless anyway.
     """
     if not pass_hist:
-        return floor_secs
-    ordered = sorted(pass_hist)
-    idx = min(len(ordered) - 1, max(0, int(round(0.9 * len(ordered))) - 1))
-    p90 = ordered[idx]
-    return max(floor_secs, p90 * headroom)
+        step = floor_secs
+    else:
+        ordered = sorted(pass_hist)
+        mid = len(ordered) // 2
+        med = (ordered[mid] if len(ordered) % 2 else
+               0.5 * (ordered[mid - 1] + ordered[mid]))
+        step = max(floor_secs, med * headroom)
+    if max_step_secs is not None:
+        step = min(step, max_step_secs)
+    return step
+
+
+class LatencyLog:
+    """Per-word spoken -> committed latency, written as CSV.
+
+    The backend log is prose for humans; this is the machine-readable artifact
+    you can plot. One row per committed word, plus event rows for cycles that
+    committed nothing (gate skips, watchdogs, resyncs) so a gap in the data is
+    explainable rather than invisible.
+
+    Columns: wall, cycle, event, word, audio_end_s, latency_s, pass_s,
+    target_s, buffer_s.
+    """
+
+    HEADER = ["wall", "cycle", "event", "word", "audio_end_s",
+              "latency_s", "pass_s", "target_s", "buffer_s"]
+
+    def __init__(self, path):
+        self.path = path
+        self.f = None
+        self.latencies = []
+        self.words = 0
+        self.events = collections.Counter()
+        if not path:
+            return
+        try:
+            self.f = open(path, "w", encoding="utf-8", newline="")
+            self.w = csv.writer(self.f)
+            self.w.writerow(self.HEADER)
+            self.f.flush()
+        except OSError as exc:
+            log("latency log disabled: %s" % exc)
+            self.f = None
+
+    def _row(self, cycle, event, word, audio_end, latency, pass_s, target, buf):
+        if not self.f:
+            return
+        self.w.writerow(["%.3f" % time.time(), cycle, event, word,
+                         "%.2f" % audio_end, "%.3f" % latency,
+                         "%.3f" % pass_s, "%.3f" % target, "%.2f" % buf])
+        self.f.flush()
+
+    def add_word(self, cycle, word, latency, pass_s, target, buf):
+        self.latencies.append(latency)
+        self.words += 1
+        self._row(cycle, "word", word.text, word.end, latency,
+                  pass_s, target, buf)
+
+    def add_event(self, cycle, event, pass_s, target, buf):
+        self.events[event] += 1
+        self._row(cycle, event, "", 0.0, 0.0, pass_s, target, buf)
+
+    def summary(self):
+        """One-line distribution for the backend log."""
+        if not self.latencies:
+            ev = ", ".join("%s=%d" % kv for kv in sorted(self.events.items()))
+            return "latency: no committed words" + (" (%s)" % ev if ev else "")
+        ordered = sorted(self.latencies)
+        p50 = ordered[len(ordered) // 2]
+        p90 = ordered[min(len(ordered) - 1, int(round(0.9 * len(ordered))) - 1)]
+        return ("latency: %d words, median %.2fs, p90 %.2fs, max %.2fs"
+                % (self.words, p50, p90, ordered[-1]))
+
+    def close(self):
+        if self.f:
+            self.f.close()
+            self.f = None
+
+
+class AudioWriter:
+    """Append the captured mono 16 kHz audio to a WAV as the session runs.
+
+    Without this a live session leaves no audio, so a reported freeze can only
+    be argued about, never replayed. With it, any stall in `.backend.log` maps
+    to a timestamp in the WAV and can be re-decoded offline -- which is exactly
+    how the temperature-fallback stalls were found.
+
+    Digital silence is written for the zero-padding `collect_step` adds when the
+    device is idle, so the file stays aligned with session time.
+    """
+
+    def __init__(self, path):
+        self.w = None
+        if not path:
+            return
+        try:
+            self.w = wave.open(path, "wb")
+            self.w.setnchannels(1)
+            self.w.setsampwidth(2)
+            self.w.setframerate(TARGET_RATE)
+        except OSError as exc:
+            log("audio dump disabled: %s" % exc)
+            self.w = None
+
+    def add(self, mono):
+        if self.w is None:
+            return
+        x = np.clip(mono, -1.0, 1.0)
+        self.w.writeframes((x * 32767.0).astype("<i2").tobytes())
+
+    def close(self):
+        if self.w is not None:
+            # wave rewrites the header with the true frame count on close.
+            self.w.close()
+            self.w = None
 
 
 def cmd_live(p, args):
@@ -403,6 +519,13 @@ def cmd_live(p, args):
 
     from streaming import RollingStreamer
 
+    # `full` leaves faster-whisper's default temperature list untouched (None
+    # means "do not pass the argument"). The others are the measured policies
+    # from the freeze investigation: `off` removed 43 of 44 slow passes.
+    temperature = {"full": None,
+                   "short": [0.0, 0.2, 0.4],
+                   "off": 0.0}[args.temp_fallback]
+
     streamer = RollingStreamer(
         model,
         language=args.language,
@@ -419,6 +542,7 @@ def cmd_live(p, args):
         hallucination_silence_threshold=args.hallucination_silence_threshold,
         compression_ratio_threshold=args.compression_ratio_threshold,
         log_prob_threshold=args.log_prob_threshold,
+        temperature=temperature,
     )
 
     emit(
@@ -432,9 +556,6 @@ def cmd_live(p, args):
         }
     )
     log("Live transcription started — Ctrl+C to stop.")
-    # One-shot watchdog: if the process ever wedges, dump every thread's stack
-    # to stderr once so the frozen frame is on record (M3 stall forensics).
-    faulthandler.dump_traceback_later(120, repeat=False)
 
     stop_event = threading.Event()
 
@@ -471,9 +592,12 @@ def cmd_live(p, args):
 
     pass_hist = collections.deque(maxlen=12)
     consumed = 0.0                 # seconds of audio taken from the device
+    latlog = LatencyLog(args.latency_csv)
+    dump = AudioWriter(args.dump_audio)
 
     def plan_step_secs():
-        return plan_step(args.step_secs, args.step_headroom, pass_hist)
+        return plan_step(args.step_secs, args.step_headroom, pass_hist,
+                         args.max_step_secs)
 
     def drop_backlog(excess):
         """Discard `excess` seconds of audio from the oldest end.
@@ -544,6 +668,7 @@ def cmd_live(p, args):
         while not stop_event.is_set():
             target = plan_step_secs()
             step = collect_step(target)
+            dump.add(step)
             if stop_event.is_set():
                 break
             n_chunk += 1
@@ -564,11 +689,42 @@ def cmd_live(p, args):
                 log("[%s step %d] backlog %.2fs > %.2fs, dropped %.2fs"
                     % (clock, n_chunk, behind, args.max_backlog, dropped))
 
-            log("[%s step %d] target %.2fs pass %.3fs buffer %.1fs "
+            now = time.perf_counter()
+            event = streamer.last_event or "none"
+            for w in committed:
+                latlog.add_word(n_chunk, w, streamer.word_latency(w, now),
+                                streamer.pass_secs, target,
+                                streamer.pass_buf_secs)
+            if not committed:
+                latlog.add_event(n_chunk, event, streamer.pass_secs, target,
+                                 streamer.pass_buf_secs)
+
+            log("[%s step %d] %-8s target %.2fs pass %.3fs buffer %.1fs "
                 "backlog %.2fs -> +%d committed, %d unstable"
-                % (clock, n_chunk, target, streamer.pass_secs,
-                   streamer.buf_secs, max(behind, 0.0),
+                % (clock, n_chunk, event, target, streamer.pass_secs,
+                   streamer.pass_buf_secs, max(behind, 0.0),
                    len(committed), len(unstable)))
+
+            # A burst is the visible symptom of a long freeze: audio piled up
+            # behind a slow cycle and then arrived all at once. Flag it so the
+            # log shows the cause instead of an unexplained wall of text.
+            if len(committed) >= 20:
+                log("[%s step %d] BURST %d words after target %.2fs "
+                    "pass %.3fs" % (clock, n_chunk, len(committed), target,
+                                    streamer.pass_secs))
+
+            # A slow pass is the freeze itself. faster-whisper's temperature
+            # fallback re-decodes a failing segment at up to six temperatures,
+            # so a small buffer can take seconds and often yields nothing --
+            # measured: 44 such passes and 99.5s of stall per 150s of audio.
+            # `pass_buf_secs` distinguishes "big buffer, fairly priced" from
+            # "small buffer, wildly overpriced", which is the actual bug.
+            if streamer.pass_secs >= args.slow_pass_secs:
+                log("[%s step %d] SLOWPASS %.2fs on %.1fs of audio%s "
+                    "(event=%s)" % (clock, n_chunk, streamer.pass_secs,
+                                    streamer.pass_buf_secs,
+                                    ", no words" if streamer.pass_empty else "",
+                                    event))
 
             if committed:
                 text = " ".join(w.text for w in committed)
@@ -588,12 +744,20 @@ def cmd_live(p, args):
         try:
             tail = streamer.flush()
             if tail:
+                now = time.perf_counter()
+                for w in tail:
+                    latlog.add_word(n_chunk, w, streamer.word_latency(w, now),
+                                    streamer.pass_secs, 0.0,
+                                    streamer.pass_buf_secs)
                 text = " ".join(w.text for w in tail)
                 for line, lt0, lt1 in assembler.add_chunk(text, tail[0].start,
                                                           tail[-1].end):
                     emit_final(line, lt0, lt1)
         except Exception as exc:
             log("streamer flush failed: %s" % exc)
+        log(latlog.summary())
+        latlog.close()
+        dump.close()
         tail_final = assembler.flush()
         if tail_final is not None:
             emit_final(*tail_final)
@@ -622,8 +786,30 @@ def main():
                          "over 0.3s; a fixed small step cannot keep up and "
                          "caption lag grows without bound")
     ap.add_argument("--step-headroom", type=float, default=1.25,
-                    help="multiply the p90 pass time by this to size each "
+                    help="multiply the median pass time by this to size each "
                          "cycle, so consumption matches processing capacity")
+    ap.add_argument("--max-step-secs", type=float, default=2.5,
+                    help="hard ceiling on the adaptive step. Without it a "
+                         "single slow pass ratchets the step up (measured: "
+                         "18s pass -> 16.8s step -> 19.5s step), which freezes "
+                         "captions and then flushes a burst")
+    ap.add_argument("--latency-csv", default="",
+                    help="write per-word spoken->committed latency as CSV")
+    ap.add_argument("--dump-audio", default="",
+                    help="write the captured mono 16k audio to this WAV, so a "
+                         "session with a stall can be replayed offline")
+    ap.add_argument("--slow-pass-secs", type=float, default=1.5,
+                    help="log a SLOWPASS marker when a decode takes at least "
+                         "this long. A slow pass on a *small* buffer is the "
+                         "temperature-fallback signature, not a big buffer")
+    ap.add_argument("--temp-fallback", choices=["full", "short", "off"],
+                    default="off",
+                    help="temperature fallback policy. off (default) passes "
+                         "temperature 0, so a failing segment is never retried; "
+                         "short caps retries at three; full is faster-whisper's "
+                         "six-temperature default. Measured on 150s of "
+                         "narration: off 1 slow pass / 4.8s stall, short 27 / "
+                         "60.7s, full 55 / 220.8s -- at identical WER")
     ap.add_argument("--max-backlog", type=float, default=1.5,
                     help="seconds of audio allowed to queue before the "
                          "oldest is dropped. Safety net: bounds caption lag "

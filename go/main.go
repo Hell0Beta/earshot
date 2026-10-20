@@ -528,7 +528,10 @@ func main() {
 	deviceFlag := flag.String("device", "auto", "inference device: auto, cuda or cpu")
 	computeFlag := flag.String("compute-type", "", "ctranslate2 compute type (auto)")
 	stepSecs := flag.Float64("step-secs", 0.3, "minimum audio per cycle; the effective step adapts to measured inference cost")
-	stepHeadroom := flag.Float64("step-headroom", 1.25, "multiplier on the p90 pass time used to size each cycle")
+	stepHeadroom := flag.Float64("step-headroom", 1.25, "multiplier on the median pass time used to size each cycle")
+	maxStepSecs := flag.Float64("max-step-secs", 2.5, "hard ceiling on the adaptive step, so one slow pass cannot freeze captions")
+	tempFallback := flag.String("temp-fallback", "off", "temperature fallback: off (default), short or full. A segment failing Whisper's confidence checks is otherwise retried at up to six temperatures, which freezes the display")
+	saveAudio := flag.Bool("save-audio", true, "save the captured audio for the newest few sessions, so a stall can be replayed")
 	maxBacklog := flag.Float64("max-backlog", 1.5, "seconds of audio allowed to queue before the oldest is dropped")
 	maxBufSecs := flag.Float64("max-buf-secs", 12, "rolling buffer cap before the unstable tail is flushed")
 	pauseSecs := flag.Float64("pause-secs", 0.2, "trailing silence that counts as a pause and commits the tail")
@@ -584,6 +587,11 @@ func main() {
 		} else if n > 0 {
 			fmt.Printf("pruned %d old transcript(s), keeping %d\n", n, *keep)
 		}
+		if n, err := pruneAudio(*outDir, audioKeep); err != nil {
+			fmt.Fprintf(os.Stderr, "prune audio: %v\n", err)
+		} else if n > 0 {
+			fmt.Printf("pruned %d old recording(s), keeping %d\n", n, audioKeep)
+		}
 	}
 	if *stepSecs <= 0 {
 		fmt.Fprintf(os.Stderr, "--step-secs must be positive (got %.2f)\n", *stepSecs)
@@ -591,6 +599,10 @@ func main() {
 	}
 	if *maxBufSecs < *stepSecs {
 		fmt.Fprintf(os.Stderr, "--max-buf-secs must be >= --step-secs (got %.2f < %.2f)\n", *maxBufSecs, *stepSecs)
+		os.Exit(2)
+	}
+	if *maxStepSecs < *stepSecs {
+		fmt.Fprintf(os.Stderr, "--max-step-secs must be >= --step-secs (got %.2f < %.2f)\n", *maxStepSecs, *stepSecs)
 		os.Exit(2)
 	}
 
@@ -605,21 +617,28 @@ func main() {
 	// Captions are appended after the header; corrections rewrite byte spans
 	// in place, so seed the running offset past the header.
 	headerPos, _ := f.Seek(0, io.SeekCurrent)
-	fmt.Fprintf(f, "# Earshot %s (build %s)\n\nmodel: %s (%s/%s), step %.2fs, buffer cap %.1fs, beam %d, block %d+%d%s\n\n",
+	fmt.Fprintf(f, "# Earshot %s (build %s)\n\nmodel: %s (%s/%s), step %.2fs, buffer cap %.1fs, beam %d, temp-fallback %s, block %d+%d%s\n\n",
 		time.Now().Format("2006-01-02 15:04"), build, *modelName, device, compute,
-		*stepSecs, *maxBufSecs, *beamSize, *blockChars, *chainChars, correctionNote(*correctModel))
+		*stepSecs, *maxBufSecs, *beamSize, *tempFallback, *blockChars, *chainChars, correctionNote(*correctModel))
 
 	cmd := exec.Command(py.Path, "-u", be.Path, "--live",
 		"--model", *modelName, "--model-dir", models,
 		"--device", device, "--compute-type", compute,
 		"--step-secs", fmt.Sprint(*stepSecs),
 		"--step-headroom", fmt.Sprint(*stepHeadroom),
+		"--max-step-secs", fmt.Sprint(*maxStepSecs),
 		"--max-backlog", fmt.Sprint(*maxBacklog),
 		"--max-buf-secs", fmt.Sprint(*maxBufSecs),
 		"--pause-secs", fmt.Sprint(*pauseSecs),
 		"--beam-size", fmt.Sprint(*beamSize),
 		"--block-chars", fmt.Sprint(*blockChars),
-		"--chain-chars", fmt.Sprint(*chainChars))
+		"--chain-chars", fmt.Sprint(*chainChars),
+		"--latency-csv", filepath.Join(transcripts, stamp+latencyCSVSuffix),
+		"--temp-fallback", *tempFallback)
+	if *saveAudio {
+		cmd.Args = append(cmd.Args, "--dump-audio",
+			filepath.Join(transcripts, stamp+audioSuffix))
+	}
 	if *correctModel != "" {
 		cmd.Args = append(cmd.Args, "--correct-model", *correctModel,
 			"--correct-threads", fmt.Sprint(*correctThreads))
@@ -703,6 +722,13 @@ func main() {
 			fmt.Fprintf(os.Stderr, "prune: %v\n", err)
 		} else if n > 0 {
 			fmt.Printf("pruned %d old transcript(s), keeping %d\n", n, *keep)
+		}
+		// Audio is pruned *after* the session ends, so this session's own
+		// recording is eligible (keep = 5 means the 6th-oldest goes).
+		if n, err := pruneAudio(*outDir, audioKeep); err != nil {
+			fmt.Fprintf(os.Stderr, "prune audio: %v\n", err)
+		} else if n > 0 {
+			fmt.Printf("pruned %d old recording(s), keeping %d\n", n, audioKeep)
 		}
 	}
 	fmt.Printf("saved %d captions to %s\n", nSaved, outPath)
