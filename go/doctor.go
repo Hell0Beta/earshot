@@ -27,6 +27,9 @@ USAGE
   earshot version         print the version
 
 KEYS (while capturing)
+  tab     switch between live captions and voice-to-text (clickable too)
+  c       copy the whole text to the clipboard
+  e       edit the text; esc finishes (speech during editing is not merged)
   space   pause / resume the display (the backend keeps running)
   q       quit, flush the last sentence and save the transcript
   home    jump to the newest caption      end   jump to the oldest
@@ -47,9 +50,14 @@ COMMON FLAGS
                      replayed (default on; --save-audio=false to disable)
   --max-backlog N    seconds of audio allowed to queue before old audio is
                      dropped, which bounds caption lag (default 1.5)
-  --beam-size N       beam width (default 5)
+  --beam-size N       beam width (default 1: greedy, fits call-quality
+                      audio; wider beams pay +0.6-0.9s/30s on hot spans)
   --block-chars N     sentence block size (default 200)
-  --correct-model F   GGUF model; polish each sentence with an LLM (off)
+  --v2t               start in voice-to-text mode: the text is polished for
+                     readability, copyable, and editable
+  --correct-model F   GGUF model used to polish (auto: <models>/llm/*.gguf)
+  --correct-sentences also repair each committed sentence as it lands; voice-
+                     to-text polishes the whole document instead
   --out-dir DIR       transcripts (default <data dir>/transcripts)
   --keep N            transcript sessions to retain (default 30)
   --splash-style shimmer|rainbow
@@ -138,6 +146,19 @@ func runDoctor(args []string) int {
 		info = cached
 	}
 	checks = append(checks, check{"model cache", true, false, info, ""})
+
+	// 5b. voice-to-text model. Optional: without it the pane still works, it
+	// just cannot add punctuation.
+	polish := findPolishModel(models)
+	polishOK := polish != ""
+	polishInfo := "none - voice to text will show raw text"
+	polishFix := "drop a GGUF into " + filepath.Join(models, "llm") +
+		" or pass --correct-model"
+	if polishOK {
+		polishInfo = polish
+		polishFix = ""
+	}
+	checks = append(checks, check{"voice-to-text model", polishOK, false, polishInfo, polishFix})
 
 	// 6. CUDA libraries
 	cudaOK := cudaDLLsReady()

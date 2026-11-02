@@ -368,6 +368,24 @@ class RollingStreamer:
         self.buf = self.buf[n:]
         self.buf_t0 += n / SR
 
+    def reset(self, resume_at=0.0):
+        """Forget all audio-derived state after the source device changes.
+
+        `resume_at` keeps the absolute clock monotonic: timestamps in the
+        transcript must not jump backwards when the user switches between
+        system audio and the microphone.
+        """
+        self.buf = np.zeros(0, dtype=np.float32)
+        self.buf_t0 = float(resume_at)
+        self.sp = StablePrefix(resync_passes=self.resync_passes)
+        self.history = ""
+        self.pass_secs = 0.0
+        self.pass_buf_secs = 0.0
+        self.pass_empty = False
+        self.last_event = ""
+        self._arrival_perf = None
+        self._arrival_abs = self.buf_t0
+
     def feed(self, audio):
         """Add `audio` (float32 mono 16 kHz) and return (committed, unstable)."""
         self.buf = np.concatenate([self.buf, audio.astype(np.float32)])
@@ -474,6 +492,17 @@ class RollingStreamer:
             self.history = (self.history + " " +
                             " ".join(w.text for w in committed)).strip()[-1000:]
         return committed, unstable
+
+    def commit_now(self):
+        """Commit the pending tail now and drop the audio it covered.
+
+        Used when the user asks to edit or copy mid-session: the words become
+        final immediately, and without cutting the buffer the next pass would
+        re-decode the same audio and emit them a second time.
+        """
+        tail = self.flush()
+        self._cut(self.buf_t0 + self.buf_secs)
+        return tail
 
     def flush(self):
         """Commit whatever is still unstable (session end).

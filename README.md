@@ -60,6 +60,10 @@ npx @hell0beta/earshot
   travelling highlight, plus a mini banner in the header while paused
 - ⏸️ **Pause without losing audio** &mdash; freeze the display, the backend keeps
   listening; unpause and the sentence picks up where it left off
+- 🎙️ **Voice to text** &mdash; `tab` switches to a dictation pane and captures your
+  **microphone** instead of the system audio: fillers removed,
+  punctuation added by a small local LLM, `c` copies the whole text and `e` lets
+  you edit it. Saved as a timestamped `.txt` next to the transcript
 - 📝 **Autosaved transcripts** &mdash; every session written to a timestamped
   `.md`, with an automatic retention cap (30 sessions by default)
 - 🩺 **`earshot doctor`** &mdash; one command that tells you exactly what is
@@ -135,6 +139,10 @@ with an unknown-flag error &mdash; delete the argument.
 
 | Key            | Action                                              |
 | -------------- | --------------------------------------------------- |
+| `tab`          | switch between live captions and voice to text (also clickable in the header) |
+| `c`            | copy the whole text to the clipboard                |
+| `e`            | edit the active mode's text; `esc` finishes. Speech while editing is kept in the transcript but not merged into your text |
+| `x`            | clear the active mode's on-screen text and start fresh (the `.md`/`.txt` file keeps everything) |
 | `space`        | pause / resume the display (backend keeps listening) |
 | `q` / `ctrl+c` | quit &mdash; flushes the last sentence and saves    |
 | `home`         | jump to the newest caption                          |
@@ -155,7 +163,10 @@ with an unknown-flag error &mdash; delete the argument.
 | `--device WHAT`     | `auto`, `cuda` or `cpu`                                  | `auto`               |
 | `--compute-type T`  | CTranslate2 compute type                                 | auto per device      |
 | `--step-secs N`     | *minimum* audio per cycle. The real step adapts to measured inference cost (see `--step-headroom`) | `0.3`         |
-| `--step-headroom N` | multiplier on the p90 pass time used to size each cycle. Raise if captions lag on a slow machine | `1.25`         |
+| `--step-headroom N` | multiplier on the median pass time used to size each cycle. Raise if captions lag on a slow machine | `1.25`         |
+| `--max-step-secs N` | hard ceiling on the adaptive step, so one slow pass cannot freeze the display | `2.5`            |
+| `--temp-fallback M` | `off`, `short` or `full`. Whisper's retry-at-more-temperatures loop freezes the display; `off` measured identical accuracy and 2.4x faster | `off` |
+| `--save-audio`      | keep the newest 5 sessions' audio (`.audio.wav`) so a stall can be replayed | on |
 | `--max-backlog N`   | seconds of audio allowed to queue before the oldest is dropped. Caps caption lag | `1.5`           |
 | `--max-buf-secs N`  | rolling buffer cap before the unstable tail is flushed   | `12`               |
 | `--pause-secs N`    | trailing silence that counts as a pause and commits the tail | `0.2`          |
@@ -163,8 +174,10 @@ with an unknown-flag error &mdash; delete the argument.
 | `--stall-passes N` | force-flush the tail after N passes with no commit. Bounds any stall | `6`              |
 | `--beam-size N`     | beam width (`1` = greedy, cannot recover a bad early token)      | `5`                  |
 | `--block-chars N`   | characters per committed sentence                                | `200`                |
-| `--correct-model F` | GGUF model path; each committed sentence is polished by an LLM   | off                  |
-| `--correct-threads` | threads for the correction model (`0` = auto)                    | `0`                  |
+| `--v2t`             | start in voice-to-text mode                             | off                  |
+| `--correct-model F` | GGUF model used to punctuate voice-to-text (auto: first GGUF in `<data>/models/llm`) | auto |
+| `--correct-sentences` | also repair each committed sentence as it lands (extra work; off for v2t) | off |
+| `--correct-threads` | threads for the LLM (`0` = auto)                        | `0`                  |
 | `--chain-chars N`   | trailing characters chained into the next block          | `15`                 |
 | `--out-dir DIR`     | where transcripts are written                            | `<data>/transcripts` |
 | `--keep N`          | transcript sessions to retain (`0` keeps none)           | `30`                 |

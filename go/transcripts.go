@@ -26,6 +26,10 @@ const latencyCSVSuffix = ".latency.csv"
 // sessions are kept, so a stall can still be replayed.
 const audioSuffix = ".audio.wav"
 
+// textSuffix holds the voice-to-text document: plain text, no timestamps, so it
+// can be pasted without editing. Pruned with its session like the .md.
+const textSuffix = ".txt"
+
 // audioKeep is how many sessions' audio survive. Deliberately tiny.
 const audioKeep = 5
 
@@ -102,6 +106,11 @@ func pruneTranscripts(dir string, keep int) (int, error) {
 			if sessionStamp.MatchString(stem + ".md") {
 				orphanLogs[stem] = true
 			}
+		case strings.HasSuffix(name, textSuffix):
+			stem := strings.TrimSuffix(name, textSuffix)
+			if sessionStamp.MatchString(stem + ".md") {
+				orphanLogs[stem] = true
+			}
 		}
 	}
 
@@ -114,7 +123,7 @@ func pruneTranscripts(dir string, keep int) (int, error) {
 			continue
 		}
 		gone := false
-		for _, f := range []string{stem + ".md", stem + backendLogSuffix, stem + latencyCSVSuffix} {
+		for _, f := range []string{stem + ".md", stem + backendLogSuffix, stem + latencyCSVSuffix, stem + textSuffix} {
 			if err := os.Remove(filepath.Join(dir, f)); err == nil {
 				gone = true
 			} else if !os.IsNotExist(err) {
@@ -138,7 +147,7 @@ func pruneTranscripts(dir string, keep int) (int, error) {
 			if i < keep {
 				continue
 			}
-			for _, suffix := range []string{backendLogSuffix, latencyCSVSuffix} {
+			for _, suffix := range []string{backendLogSuffix, latencyCSVSuffix, textSuffix} {
 				if err := os.Remove(filepath.Join(dir, stem+suffix)); err == nil {
 					removed++
 				}

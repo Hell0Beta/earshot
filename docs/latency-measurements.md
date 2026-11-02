@@ -5,6 +5,131 @@ Raw numbers behind the design decisions in
 Xeon E-2276M (6 cores / 12 threads), `small.en` via faster-whisper on CUDA
 float16.
 
+## First real noisy-input capture: Zoom lecture (2026-10-23)
+
+Everything prior to this section is measured on **clean narration**. The
+Oct 23 09:15 session — a ~51-min lecture watched over Zoom, captured through
+WASAPI loopback — is the first measurement against real call-quality audio.
+Its artifacts live in `backend/testdata/oct23zoom/` (gitignored; the 108 MB
+wav is the fixture). Reference-free only: no ground-truth transcript exists,
+so **none of the numbers below is a WER claim**. Analyzer:
+`backend/analyze_session.py <stem>`.
+
+Original session, `small.en` cuda/float16, temp-fallback off, 4867 loop steps,
+3565 s wall:
+
+| | |
+|---|---|
+| caption words | 5557 over 51m38s |
+| committed-word latency | median **1.83s**, p90 3.03s, max 7.46s |
+| 10-min drift of that median | 1.66 → 1.90 → 1.97 → 1.87 → 1.78 → 1.72 — **flat** (adaptive step held) |
+| decode pass cost | median 0.66s, p90 0.85s, max **5.0s** |
+| pass duty vs wall | 2115s of decode in 3565s = **59%** |
+| slow passes ≥1.5s | **12**, 36.2s total, **all on 0.9–4.8s buffers** |
+| dup5 within the transcript | 30 (mostly the stock phrases below) |
+| hallucination artifacts | 26 — `thank you very much` x19, `thanks for watching` x6, `thanks a lot` x1 |
+| polish pass (.md→.txt) | LCS survives 86% / 89% — the LLM rewrites ~13% of the text |
+
+Two headline differences vs the clean-narration numbers above:
+
+1. **Word latency is +0.7s** (1.83s vs 1.10s) but flat for a whole hour on
+   noisy audio. Committing requires two agreeing passes, and Zoom audio
+   gives the model real disagreements plus pauses — the extra latency is
+   LocalAgreement waiting, not backlog.
+2. **Pass cost is nearly flat vs buffer** (0.57s @ 1s buffer → 0.82s @ 5s),
+   the reverse of the 4s cliff measured on narration — because Zoom audio is
+   dense speech, so VAD trims almost nothing, while the large buffers in the
+   table belong to cap flushes over *quiet* stretches whose trimmed
+   speech is short. Cost follows **speech seconds in the buffer**, not buffer
+   seconds.
+
+### Why pass cost varies — measured, not guessed
+
+Four families of cause were in play; three are now measured and one is
+absolved:
+
+- **Buffer size / the 4s cliff — mostly absolved for this input.** The cliff
+  exists, but on this audio VAD trims little, so the cliff is a gentle slope
+  (0.57→0.92s from 1s→5s buffers). The 12s cap-flush rows sit at ~0.59s
+  median because those buffers hold quiet audio.
+- **Temperature fallback — absolved.** The build runs `--temp-fallback off`;
+  the recorded slow passes are not its signature.
+- **GPU contention / thermal — absolved (today's runs).** Replaying the
+  session's first 2 min repeatedly, `nvidia-smi` sampled every second showed
+  SM clocks pinned at 945 MHz / P2 (299 of 308 samples), ≤67°C. No clock dips
+  accompany even a 12.9s pass.
+- **Content-driven hot spots, magnitude from cuDNN nondeterminism —
+  confirmed.** The first 120s of the session audio was replayed through the
+  current `RollingStreamer` **four times** (fresh model load each time). Slow
+  passes (≥1.5s) reproduce at the **same audio positions** — 23.1/23.4s,
+  43.2/43.8s, 57.3s, 63.3/63.6s, 102.3–102.9s, 114.3–114.6s — all on small
+  buffers (0.3–1.6s). But the magnitude at each spot swings run to run: 7.7s
+  vs 2.6s at 23.4s, 8.1s vs 2.0s at 114.6s, 12.9s at 26.1s in one run where
+  the same spot passed in under 2s in two others. Same input, same clock
+  state, same model: the variance is the **beam-search instability of
+  high-entropy (noisy/hallucination-prone) audio**, consistent with the
+  quantified noise floor recorded at the end of
+  [streaming-latency.md](streaming-latency.md). The docs' one surviving
+  "~4.8s pass under `off`, cause unknown" is the same phenomenon.
+
+### Replay vs the live session (first 2 min, no reference)
+
+| | live session | replay today (`score_stream`, step 0.3) |
+|---|---|---|
+| wall vs audio | real-time piped | **1.44–1.82x realtime** (slower than live pacing) |
+| words in 120s | 191 | 174 |
+| mutual LCS overlap | — | **72 words: 38% of live / 41% of replay** |
+| artifacts in committed text | 3 in first 2 min | 11 (`thank you` x5, `thanks for watching` x2, `bye` x2) |
+| VAD gate | — | skipped 35.2s/120.3s (29%) as non-speech |
+| stalls during speech | — | 20 (19 pause/cap flushes by design, 1 deadlock of 1.2s) |
+
+`--dump-audio` + `score_stream.py --dur` on this fixture is now the standing
+replay harness for Zoom-quality audio; `probe_live.py` attributes its stalls
+without a reference. The duplicate-position hot spots also give the first
+concrete pointer for speed-up work: the model slow on the *same* audio spans
+they hallucinate on.
+
+### Mitigation sweep on the hot spots (`backend/bench_hotspots.py`)
+
+The six reproducible slow spans (30s total, sliced into
+`testdata/oct23zoom/hotslices.wav`) were decoded 8× each per config:
+
+| beam | compute | median | p10–p90 | max |
+|---|---|---|---|---|
+| 1 | float16 | **1.94s** | 1.83–3.78 | 3.78 |
+| 5 | float16 | 2.49s | 2.48–2.66 | 2.66 |
+| 1 | int8_float16 | 1.94s | 1.82–2.26 | 2.26 |
+| 5 | int8_float16 | 2.82s | 2.78–3.85 | 3.85 |
+| 1 | int8 | 1.94s | 1.92–2.10 | 2.10 |
+| 5 | int8 | 2.78s | 2.76–2.80 | 2.80 |
+
+Findings:
+
+- **`--compute int8` — rejected.** Identical medians (1.94s), no tail
+  taming. Precision is not the driver of hot-spot cost.
+- **Beam 1 contradicts the "beam is free" row above** (that sweep was
+  measured on narration): on hot-spot content beam 5 pays +0.6–0.9s per
+  30s decode. Full 120s replay cost: beam 1 mean pass **0.473s vs 0.543s**,
+  wall 191s vs 219s (13% faster). Word counts 168 vs 174; both overlap the
+  live session's text within a few points (42%/48% vs 38%/41% LCS) — **inside
+  the ±15-point noise floor**, so no accuracy claim either way.
+- **The outlier tail is not fixed** by any config (one 3.8–8.2s pass per
+  run remains), and within-config 8-run spreads are tight — so the replay's
+  1.5→12.9s jumps come from *pass state* (VAD trim and beam path differ per
+  cycle), not from cuDNN noise alone.
+
+**Decision: nothing to ship by default.** The pipeline already bounds an
+outlier's latency impact (`plan_step` median + 2.5s clamp + `--max-backlog`),
+and flipping the beam default on proxy metrics alone is exactly the
+Whisper-vs-Whisper mistake recorded at the bottom of
+[streaming-latency.md](streaming-latency.md). But `--beam-size 1` is
+**already available** at the CLI and is now the *recommended* setting for
+Zoom/call-quality input where freezes feel worse: same accuracy within
+noise, ~13% cheaper, and greedy decode cannot wander the way the 12.9s pass
+suggests beam search can. WER-grade verdict must wait for a human
+reference transcript of the fixture.
+
+
 ## Inference cost per pass
 
 **How to measure this correctly.** `WhisperModel.transcribe()` returns a

@@ -4,8 +4,6 @@ import (
 	"fmt"
 	"strings"
 	"testing"
-
-	"github.com/charmbracelet/lipgloss"
 )
 
 func TestSplashGrid(t *testing.T) {
@@ -129,31 +127,48 @@ func TestSweepStops(t *testing.T) {
 	}
 }
 
-func TestUnlitLettersStayLegible(t *testing.T) {
-	// lipgloss.Style holds a func field, so it can't be compared with ==; and
-	// with no TTY the profile is Ascii, so rendered output drops the colour
-	// entirely. Compare the colours themselves.
-	dim := splashStopStyle[stopDim].GetForeground()
-	mid := splashStopStyle[stopMid].GetForeground()
-	bright := splashStopStyle[stopBright].GetForeground()
-	if dim != lipgloss.Color("#6c6c6c") {
-		t.Errorf("dim stop = %v, want #6c6c6c", dim)
+func TestSplashKeepsTheWordmarkBlueWithALegibleSweep(t *testing.T) {
+	const artW = 82
+	dim := splashShimmerColor(0, artW, stopDim)
+	mid := splashShimmerColor(0, artW, stopMid)
+	bright := splashShimmerColor(0, artW, stopBright)
+
+	d := lum(t, dim)
+	m := lum(t, mid)
+	b := lum(t, bright)
+	if !(d < m && m < b) {
+		t.Fatalf("sweep is not ordered dark -> light: %s %.0f, %s %.0f, %s %.0f",
+			dim, d, mid, m, bright, b)
 	}
-	if mid != lipgloss.Color("#b0b0b0") {
-		t.Errorf("mid stop = %v, want #b0b0b0", mid)
+	// Every stop stays in the blue family: the brand identity, not grey.
+	for _, c := range []string{dim, mid, bright} {
+		r, _, bl := rgbParts(t, c)
+		if bl <= r {
+			t.Errorf("%s is not blue (r=%d b=%d)", c, r, bl)
+		}
 	}
-	if bright != lipgloss.Color("#ffffff") {
-		t.Errorf("bright stop = %v, want #ffffff", bright)
+	// Left is cyan, right is indigo: the same ramp the header uses, which
+	// means the green channel falls away across the banner.
+	_, lg, _ := rgbParts(t, splashShimmerColor(0, artW, stopMid))
+	_, rg, _ := rgbParts(t, splashShimmerColor(artW-1, artW, stopMid))
+	if lg < rg+40 {
+		t.Errorf("gradient runs the wrong way: left green %d, right green %d", lg, rg)
 	}
-	if dim == bright {
-		t.Errorf("dim and bright stops are identical: %v", dim)
+}
+
+func rgbParts(t *testing.T, hex string) (int, int, int) {
+	t.Helper()
+	var r, g, b int
+	if _, err := fmt.Sscanf(hex, "#%02x%02x%02x", &r, &g, &b); err != nil {
+		t.Fatalf("bad colour %q: %v", hex, err)
 	}
-	if mid == dim {
-		t.Errorf("mid and dim stops are identical: %v", mid)
-	}
-	if mid == bright {
-		t.Errorf("mid and bright stops are identical: %v", mid)
-	}
+	return r, g, b
+}
+
+func lum(t *testing.T, hex string) float64 {
+	t.Helper()
+	r, g, b := rgbParts(t, hex)
+	return 0.2126*float64(r) + 0.7152*float64(g) + 0.0722*float64(b)
 }
 
 func TestColumnStylesRespectsStyleFlag(t *testing.T) {

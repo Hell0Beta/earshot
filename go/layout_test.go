@@ -245,9 +245,9 @@ func TestPauseClampsViewport(t *testing.T) {
 	if !paused.paused {
 		t.Fatalf("space did not toggle pause")
 	}
-	// Pausing adds the 5 banner rows plus one extra blank separator, so the
-	// header grows from 2 rows to 2+len(splashArt)+1.
-	if delta, want := unpausedH-paused.viewport.Height, len(splashArt)+1; delta != want {
+	// Pausing adds the banner rows under the rule; the blank separator is
+	// already counted in both states, so the growth is exactly len(splashArt).
+	if delta, want := unpausedH-paused.viewport.Height, len(splashArt); delta != want {
 		t.Errorf("pressing space shrank the viewport by %d rows, want %d (banner + separator)",
 			delta, want)
 	}

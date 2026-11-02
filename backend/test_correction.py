@@ -22,7 +22,10 @@ class StubLlama:
         self.fail = fail
         self.seen = []
 
-    def create_chat_completion(self, messages, max_tokens, temperature):
+    def create_chat_completion(self, messages, max_tokens, temperature,
+                               **kwargs):
+        # kwargs covers decoding options (repeat_penalty, stop) the polisher
+        # passes; the stub only needs to record the prompt and reply.
         if self.delay:
             time.sleep(self.delay)
         if self.fail:
@@ -101,6 +104,98 @@ def test_empty_reply_is_rejected():
         c.submit(1, "raw")
         events = capture_emits(lambda: _drain(c))
         assert events == [], (reply, events)
+
+
+def test_clean_fillers_removes_disfluency():
+    got = correction.clean_fillers(
+        "um so the the thing is uh broken, you know, really")
+    assert got == "so the thing is broken, really", got
+
+
+def test_clean_fillers_keeps_words_that_only_look_like_filler():
+    # "like" and "do you know" are content; deleting them changes meaning.
+    got = correction.clean_fillers("do you know how the retry works i like it")
+    assert "like" in got, got
+    assert "do you know" in got, got
+
+
+def test_clean_fillers_removes_you_know_mid_sentence():
+    got = correction.clean_fillers("its broken you know and also slow")
+    assert got == "its broken and also slow", got
+
+
+def test_polish_rejects_a_summary():
+    """Losing a whole idea is worse than leaving the raw text up."""
+    c = make(StubLlama(reply="Short version."))
+    words = " ".join("word%d" % i for i in range(40))
+    assert c._polish(words) is None
+    assert c.polish_failures == 1
+
+
+def test_polish_accepts_a_faithful_result():
+    words = " ".join("word%d" % i for i in range(20))
+    c = make(StubLlama(reply=words))
+    assert c._polish(words) == words
+
+
+def test_polish_failure_still_reports_back():
+    """Silence would leave the TUI stuck on 'polishing…'."""
+    c = make(StubLlama(fail=True))
+    events = capture_emits(lambda: c._serve_polish("raw text here"))
+    assert events == [{"type": "polished", "text": ""}], events
+    assert c.polished == 0
+
+
+def test_polish_success_increments_counter():
+    c = make(StubLlama(reply="Clean text."))
+    events = capture_emits(lambda: c._serve_polish("raw text"))
+    assert events[0]["text"] == "Clean text."
+    assert c.polished == 1
+
+
+def test_polish_emits_whole_document():
+    c = make(StubLlama(reply="Clean text."))
+    out = c._polish("um so the thing is")
+    assert out == "Clean text."
+    events = capture_emits(lambda: c._emit_polished(out))
+    assert events == [{"type": "polished", "text": "Clean text."}], events
+    assert c.polished == 0, "the counter belongs to the worker, not _polish"
+
+
+def test_polish_failure_is_silent():
+    c = make(StubLlama(fail=True))
+    assert c._polish("raw") is None
+    assert c.polish_failures == 1
+
+
+def test_polish_empty_reply_is_rejected():
+    """An empty reply must not blank the dictation pane."""
+    for reply in ("", " "):
+        c = make(StubLlama(reply=reply))
+        assert c._polish("raw") is None, reply
+
+
+def test_polish_truncates_from_the_start():
+    stub = StubLlama(reply="ok")
+    c = make(stub)
+    c._polish("a" * (correction.POLISH_MAX_CHARS + 500))
+    seen = stub.seen[-1]
+    assert len(seen) <= correction.POLISH_MAX_CHARS + 1, len(seen)
+    assert seen.startswith("…"), "the tail of a long dictation is kept"
+
+
+def test_polish_queue_keeps_only_the_newest():
+    c = make(StubLlama())
+    c.submit_polish("first")
+    c.submit_polish("second")
+    assert c.polish_q.qsize() == 1
+    assert c.polish_q.get_nowait() == "second"
+
+
+def test_blank_polish_is_ignored():
+    c = make(StubLlama())
+    c.submit_polish("   ")
+    assert c.polish_q.qsize() == 0
 
 
 def _drain(c):

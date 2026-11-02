@@ -22,6 +22,9 @@ vendor/
 *.mp4
 _probe*.json
 
+# large session fixtures replayed for testing (backend/testdata/oct23zoom)
+backend/testdata/
+
 # editors / OS
 .DS_Store
 Thumbs.db

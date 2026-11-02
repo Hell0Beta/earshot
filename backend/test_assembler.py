@@ -97,6 +97,32 @@ def test_timestamps_advance_and_stay_ordered():
     assert all(t >= 0 for t in t0s + t1s), t0s
 
 
+def test_reset_forgets_pending_text_and_the_chain():
+    a = SentenceAssembler(block_chars=40, chain_chars=10)
+    a.add_chunk("the user cleared this half sentence", 0.0, 2.0)
+    a.reset()
+    assert a.draft() == ("", 0.0)
+    assert a.flush() is None
+    # The next block must not chain onto the cleared text.
+    fins = a.add_chunk("brand new start", 3.0, 4.0)
+    assert fins == [] or fins[0][0] == "brand new start"
+    assert "cleared" not in " ".join(l for l, _, _ in fins)
+
+
+def test_flush_ends_the_chain():
+    a = SentenceAssembler(block_chars=200, chain_chars=15)
+    a.add_chunk("the first sentence is long enough", 0.0, 2.0)
+    out = a.flush()
+    assert out is not None
+    assert out[0].startswith("the first sentence"), out
+    assert a.draft() == ("", 0.0)
+    # An explicit flush is a boundary: the next sentence must not begin with
+    # the tail of the one just committed (that is what duplicated text after
+    # an edit).
+    a.add_chunk("brand new words", 3.0, 4.0)
+    assert a.draft()[0] == "brand new words", a.draft()
+
+
 def test_empty_chunks_ignored():
     a = SentenceAssembler()
     assert a.add_chunk("   ", 0.0, 1.0) == []

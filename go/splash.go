@@ -36,14 +36,47 @@ const (
 )
 
 var (
-	splashStopStyle = [3]lipgloss.Style{
-		stopDim:    lipgloss.NewStyle().Foreground(lipgloss.Color("#6c6c6c")),
-		stopMid:    lipgloss.NewStyle().Foreground(lipgloss.Color("#b0b0b0")),
-		stopBright: lipgloss.NewStyle().Foreground(lipgloss.Color("#ffffff")),
-	}
 	splashStatus = lipgloss.NewStyle().Foreground(lipgloss.Color("12"))
 	splashHint   = lipgloss.NewStyle().Faint(true).Foreground(lipgloss.Color("8"))
 )
+
+// splashShimmerColor is the wordmark blue (cyan -> indigo across the banner)
+// modulated by the travelling highlight: unlit letters sit in deep blue, the
+// band lifts them toward white, and in-between columns get a mid tone. Same
+// sweep as before, same blue as the header.
+func splashShimmerColor(col, artW, stop int) string {
+	t := 0.0
+	if artW > 1 {
+		t = float64(col) / float64(artW-1)
+	}
+	rgb := [3]float64{
+		float64(wordmarkFrom[0]) + (float64(wordmarkTo[0])-float64(wordmarkFrom[0]))*t,
+		float64(wordmarkFrom[1]) + (float64(wordmarkTo[1])-float64(wordmarkFrom[1]))*t,
+		float64(wordmarkFrom[2]) + (float64(wordmarkTo[2])-float64(wordmarkFrom[2]))*t,
+	}
+	switch stop {
+	case stopBright:
+		rgb = mixRGB(rgb, [3]float64{255, 255, 255}, 0.62)
+	case stopMid:
+		rgb = mixRGB(rgb, [3]float64{255, 255, 255}, 0.18)
+	default:
+		rgb = mixRGB(rgb, [3]float64{0, 0, 0}, 0.45)
+	}
+	return rgbHex(rgb)
+}
+
+func mixRGB(a, b [3]float64, t float64) [3]float64 {
+	return [3]float64{
+		a[0] + (b[0]-a[0])*t,
+		a[1] + (b[1]-a[1])*t,
+		a[2] + (b[2]-a[2])*t,
+	}
+}
+
+func rgbHex(c [3]float64) string {
+	return fmt.Sprintf("#%02x%02x%02x",
+		int(math.Round(c[0])), int(math.Round(c[1])), int(math.Round(c[2])))
+}
 
 // sweepStops returns the luminance stop per column (stopDim/stopMid/stopBright)
 // for the travelling highlight. Split out from the renderer so it is
@@ -85,7 +118,8 @@ func columnStyles(artW, frame int, style string) []lipgloss.Style {
 	stops := sweepStops(artW, frame)
 	out := make([]lipgloss.Style, artW)
 	for c := range out {
-		out[c] = splashStopStyle[stops[c]]
+		out[c] = lipgloss.NewStyle().
+			Foreground(lipgloss.Color(splashShimmerColor(c, artW, stops[c])))
 	}
 	return out
 }

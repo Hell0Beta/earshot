@@ -92,6 +92,38 @@ func TestPruneDeletesPairedLogs(t *testing.T) {
 	}
 }
 
+// A session's voice-to-text file is pruned with the session, and a .txt whose
+// name is not one of ours is left alone.
+func TestPruneDeletesSessionText(t *testing.T) {
+	dir := t.TempDir()
+	seedSessions(t, dir, 12)
+	entries, _ := os.ReadDir(dir)
+	for _, e := range entries {
+		if sessionStamp.MatchString(e.Name()) {
+			stem := strings.TrimSuffix(e.Name(), ".md")
+			write(t, filepath.Join(dir, stem+textSuffix), "dictated\n")
+		}
+	}
+	write(t, filepath.Join(dir, "notes.txt"), "keep me\n")
+
+	if _, err := pruneTranscripts(dir, 10); err != nil {
+		t.Fatal(err)
+	}
+	texts := 0
+	entries, _ = os.ReadDir(dir)
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), textSuffix) {
+			texts++
+		}
+	}
+	if texts != 11 { // 10 sessions + notes.txt
+		t.Errorf("txt files = %d, want 11 (10 paired + notes)", texts)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "notes.txt")); err != nil {
+		t.Error("prune deleted a foreign .txt")
+	}
+}
+
 func TestPruneLeavesForeignFilesAlone(t *testing.T) {
 	dir := t.TempDir()
 	seedSessions(t, dir, 40)

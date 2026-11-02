@@ -36,6 +36,35 @@ def log(msg):
     print(msg, file=sys.stderr, flush=True)
 
 
+def parse_command(line):
+    """Interpret one stdin line from the TUI.
+
+    Returns (kind, payload): ("quit", None), ("polish", text), or (None, None)
+    for anything unrecognised. Kept separate from the reader thread so the
+    protocol can be tested without a microphone or a model.
+    """
+    line = line.strip()
+    if not line:
+        return None, None
+    if line.lower() == "quit":
+        return "quit", None
+    try:
+        cmd = json.loads(line)
+    except ValueError:
+        return None, None
+    if not isinstance(cmd, dict):
+        return None, None
+    if cmd.get("cmd") == "polish":
+        return "polish", str(cmd.get("text") or "")
+    if cmd.get("cmd") == "source" and cmd.get("kind") in ("mic", "loopback"):
+        return "source", cmd["kind"]
+    if cmd.get("cmd") == "flush":
+        return "flush", None
+    if cmd.get("cmd") == "reset":
+        return "reset", None
+    return None, None
+
+
 def emit(obj):
     sys.stdout.write(json.dumps(obj, ensure_ascii=False) + "\n")
     sys.stdout.flush()
@@ -68,6 +97,57 @@ def find_loopback(p, device_index=None):
         "Default loopback output device not found. "
         "Run with --list-devices to pick --device-index."
     )
+
+
+def find_mic(p, device_index=None):
+    """The real microphone, never a WASAPI loopback device.
+
+    pyaudiowpatch lists loopback endpoints as input devices too, so an
+    "input=True" stream on the default input can still be the speakers on
+    some systems. Dictation must never capture what the machine is playing.
+    """
+    if device_index is not None:
+        info = p.get_device_info_by_index(device_index)
+        if info.get("isLoopbackDevice"):
+            raise RuntimeError(
+                "device #%d (%s) is a loopback of the speakers, not a "
+                "microphone" % (device_index, info["name"]))
+        if int(info["maxInputChannels"]) < 1:
+            raise RuntimeError("device #%d (%s) has no input channels"
+                               % (device_index, info["name"]))
+        log("Using input device #%d: %s" % (device_index, info["name"]))
+        return info
+    import pyaudiowpatch as pyaudio
+    # WASAPI first: the legacy MME default input is the same microphone with
+    # ~100ms more buffering, and MME truncates long endpoint names.
+    try:
+        wasapi = p.get_host_api_info_by_type(pyaudio.paWASAPI)
+        info = p.get_device_info_by_index(wasapi["defaultInputDevice"])
+        if (not info.get("isLoopbackDevice")
+                and int(info["maxInputChannels"]) >= 1):
+            log("Using default WASAPI microphone: %s" % info["name"])
+            return info
+    except OSError:
+        pass
+    try:
+        info = p.get_default_input_device_info()
+        if not info.get("isLoopbackDevice"):
+            log("Using default microphone: %s" % info["name"])
+            return info
+    except OSError:
+        pass
+    for info in p.get_device_info_generator():
+        if (int(info["maxInputChannels"]) >= 1
+                and not info.get("isLoopbackDevice")):
+            log("Using microphone: %s" % info["name"])
+            return info
+    raise RuntimeError(
+        "No microphone found. Run with --list-devices to pick --device-index.")
+
+
+def find_source(p, kind, device_index=None):
+    return find_mic(p, device_index) if kind == "mic" \
+        else find_loopback(p, device_index)
 
 
 def resample_to_16k(mono, src_rate):
@@ -131,7 +211,7 @@ def cmd_list_devices(p):
     emit({"type": "status", "msg": "devices listed", "devices": devs})
 
 
-def open_loopback_stream(p, device, frames, q):
+def open_input_stream(p, device, frames, q):
     import pyaudiowpatch as pyaudio
 
     def callback(in_data, frame_count, time_info, status):
@@ -172,7 +252,7 @@ def cmd_dump(p, args):
         "Capturing %.1fs from '%s' (%dHz, %dch) — play some audio now…"
         % (args.dump_secs, device["name"], rate, channels)
     )
-    stream = open_loopback_stream(p, device, frames, q)
+    stream = open_input_stream(p, device, frames, q)
     log("stream started, collecting…")
     try:
         n_chunks = int(rate * args.dump_secs / frames) + 1
@@ -265,6 +345,14 @@ class SentenceAssembler:
         self.prev_tail = ""
         self.first = True
 
+    def reset(self):
+        """Forget pending text (the user cleared the transcript)."""
+        self.buf = ""
+        self.buf_t0 = 0.0
+        self.buf_t1 = 0.0
+        self.prev_tail = ""
+        self.first = True
+
     @staticmethod
     def _take(text, limit):
         if len(text) <= limit:
@@ -328,12 +416,19 @@ class SentenceAssembler:
         return self._compose(self.buf.strip()), self.buf_t0
 
     def flush(self):
-        """Emit the remainder, however short. Returns (line, t0, t1) or None."""
+        """Emit the remainder, however short. Returns (line, t0, t1) or None.
+
+        Also ends the chain: an explicit flush is a boundary the user asked
+        for (they are about to edit or copy), so the next live line must not
+        start with the tail of the line just committed.
+        """
         if not self.buf.strip():
             return None
         self.buf = self.buf.strip()
         out = self._emit_head(self.buf)
         self.buf = ""
+        self.prev_tail = ""
+        self.first = True
         return out
 
 
@@ -502,7 +597,19 @@ class AudioWriter:
 
 
 def cmd_live(p, args):
-    device = find_loopback(p, args.device_index)
+    source_kind = args.input
+    try:
+        device = find_source(p, source_kind, args.device_index)
+    except Exception as exc:
+        # A v2t session without a usable microphone should still start: the
+        # user can fix the device and switch again, and live captions keep
+        # working in the meantime.
+        if source_kind != "mic":
+            raise
+        emit({"type": "status",
+              "msg": "no microphone (%s) — using system audio" % exc})
+        source_kind = "loopback"
+        device = find_loopback(p, args.device_index)
     channels = int(device["maxInputChannels"])
     rate = int(device["defaultSampleRate"])
     frames = int(args.frames_per_buffer)
@@ -512,7 +619,7 @@ def cmd_live(p, args):
     model = load_model(args)
 
     q = queue.Queue()
-    stream = open_loopback_stream(p, device, frames, q)
+    stream = open_input_stream(p, device, frames, q)
 
     step_secs = args.step_secs
     assembler = SentenceAssembler(args.block_chars, args.chain_chars)
@@ -550,6 +657,7 @@ def cmd_live(p, args):
             "type": "status",
             "msg": "live",
             "device": device["name"],
+            "source": source_kind,
             "step_secs": step_secs,
             "block_chars": args.block_chars,
             "beam_size": args.beam_size,
@@ -558,13 +666,40 @@ def cmd_live(p, args):
     log("Live transcription started — Ctrl+C to stop.")
 
     stop_event = threading.Event()
+    # The TUI says which source the active mode needs; the audio loop picks the
+    # change up between cycles rather than reopening the stream from a thread.
+    source_lock = threading.Lock()
+    want_source = {"kind": source_kind}
+    # `flush` asks for the pending words to be committed *now*, so the TUI can
+    # open its editor with the complete document instead of dropping the
+    # sentence that has not agreed with a second hypothesis yet.
+    flush_req = threading.Event()
+    # `reset` is the TUI's "clear the transcript": forget the pending words so
+    # nothing the user cleared can resurface in a later update.
+    reset_req = threading.Event()
 
     def watch_stdin():
+        """Commands from the TUI: `quit`, a polish request, or a source switch.
+
+        The TUI owns the document text (it has the corrections and the user's
+        edits), so it sends the text to polish rather than asking the backend to
+        reconstruct it.
+        """
         try:
             for line in sys.stdin:
-                if line.strip().lower() == "quit":
+                kind, payload = parse_command(line)
+                if kind == "quit":
                     stop_event.set()
                     break
+                if kind == "polish" and corrector is not None:
+                    corrector.submit_polish(payload)
+                if kind == "source":
+                    with source_lock:
+                        want_source["kind"] = payload
+                if kind == "flush":
+                    flush_req.set()
+                if kind == "reset":
+                    reset_req.set()
         except Exception:
             pass
 
@@ -587,13 +722,72 @@ def cmd_live(p, args):
         )
         # LLM correction (Phase C): hand only *completed* sentences to the
         # worker. Enqueue and return — never block transcription on it.
-        if corrector is not None:
+        if corrector is not None and args.correct_sentences:
             corrector.submit(n_block, line)
 
     pass_hist = collections.deque(maxlen=12)
     consumed = 0.0                 # seconds of audio taken from the device
+    t_start = time.perf_counter()
     latlog = LatencyLog(args.latency_csv)
     dump = AudioWriter(args.dump_audio)
+
+    def switch_source(kind):
+        """Swap the capture device without losing the session.
+
+        Live captions read the speakers' loopback; dictation reads the
+        microphone. Both feed the same 16 kHz stream, so only the device and
+        the buffered audio have to change.
+        """
+        nonlocal stream, device, channels, rate, bytes_per_sec
+        nonlocal consumed, t_start, source_kind
+        try:
+            dev = find_source(p, kind, args.device_index)
+            st = open_input_stream(p, dev, frames, q)
+        except Exception as exc:
+            emit({"type": "status",
+                  "msg": "%s unavailable (%s) — still listening to %s"
+                         % (kind, exc, device["name"])})
+            with source_lock:
+                want_source["kind"] = source_kind
+            return
+        # Commit what the old device already produced: the switch is not a
+        # reason to lose the last partial sentence.
+        try:
+            tail = streamer.flush()
+            if tail:
+                text = " ".join(w.text for w in tail)
+                for line, lt0, lt1 in assembler.add_chunk(
+                        text, tail[0].start, tail[-1].end):
+                    emit_final(line, lt0, lt1)
+        except Exception as exc:
+            log("flush on source switch failed: %s" % exc)
+        resume_at = streamer.buf_t0 + streamer.buf_secs
+        streamer.reset(resume_at)
+        try:
+            stream.stop_stream()
+            stream.close()
+        except Exception:
+            pass
+        stream = st
+        device = dev
+        channels = int(dev["maxInputChannels"])
+        rate = int(dev["defaultSampleRate"])
+        bytes_per_sec = rate * channels * 2
+        # Anything queued belongs to the old device (or to the few frames the
+        # new one produced while the old stream was closing). Splicing the
+        # two timelines together would garble the first caption.
+        while True:
+            try:
+                q.get_nowait()
+            except queue.Empty:
+                break
+        consumed = resume_at
+        t_start = time.perf_counter() - consumed
+        pass_hist.clear()
+        source_kind = kind
+        log("Input switched to %s: %s" % (kind, dev["name"]))
+        emit({"type": "status", "msg": "listening to %s" % dev["name"],
+              "source": kind, "device": dev["name"]})
 
     def plan_step_secs():
         return plan_step(args.step_secs, args.step_headroom, pass_hist,
@@ -646,6 +840,8 @@ def cmd_live(p, args):
         while len(out) < want:
             if stop_event.is_set():
                 break
+            if flush_req.is_set() or reset_req.is_set():
+                break
             remaining = deadline - time.time()
             if remaining <= 0:
                 break
@@ -654,7 +850,12 @@ def cmd_live(p, args):
             except queue.Empty:
                 continue
         if len(out) < want:
-            out.extend(b"\x00" * (want - len(out)))
+            if not (flush_req.is_set() or reset_req.is_set()):
+                # The flush will re-transcribe and cut whatever did arrive;
+                # padding here would only add silence to that pass.
+                out.extend(b"\x00" * (want - len(out)))
+        if not out:
+            return np.zeros(0, dtype=np.float32)
         return bytes_to_mono16k(bytes(out), channels, rate)
 
     corrector = None
@@ -664,8 +865,28 @@ def cmd_live(p, args):
         corrector.start()
 
     try:
-        t_start = time.perf_counter()
         while not stop_event.is_set():
+            # A clear arrived mid-collect: drop the pre-clear audio and the
+            # pending sentence together, before any of it can be emitted.
+            if reset_req.is_set():
+                reset_req.clear()
+                resume = streamer.buf_t0 + streamer.buf_secs
+                streamer.reset(resume)
+                assembler.reset()
+                while True:
+                    try:
+                        q.get_nowait()
+                    except queue.Empty:
+                        break
+                consumed = resume
+                t_start = time.perf_counter() - consumed
+                pass_hist.clear()
+                emit({"type": "reset"})
+                continue
+            with source_lock:
+                wanted = want_source["kind"]
+            if wanted != source_kind:
+                switch_source(wanted)
             target = plan_step_secs()
             step = collect_step(target)
             dump.add(step)
@@ -677,6 +898,18 @@ def cmd_live(p, args):
             committed, unstable = streamer.feed(step)
             if streamer.pass_secs:
                 pass_hist.append(streamer.pass_secs)
+
+            # The TUI asked to edit/copy now: commit the words that were still
+            # waiting for a second hypothesis, so the document it receives is
+            # complete. `commit_now` also cuts the audio it just decoded.
+            flush_now = flush_req.is_set()
+            if flush_now:
+                flush_req.clear()
+                try:
+                    committed = list(committed) + list(streamer.commit_now())
+                except Exception as exc:
+                    log("flush failed: %s" % exc)
+                unstable = []
 
             # Drift guard. `consumed` is how much audio has been taken from
             # the device; wall time is how much should have arrived. Any
@@ -731,10 +964,20 @@ def cmd_live(p, args):
                 ct0, ct1 = committed[0].start, committed[-1].end
                 for line, lt0, lt1 in assembler.add_chunk(text, ct0, ct1):
                     emit_final(line, lt0, lt1)
+            if flush_now:
+                # The user asked for everything now. The assembler normally
+                # holds a short sentence until 200 chars, so without this the
+                # editor's text and the live draft would show the same
+                # sentence twice.
+                rest = assembler.flush()
+                if rest:
+                    emit_final(*rest)
 
             dtext, dt0 = compose_live_line(assembler, unstable)
             emit({"type": "draft", "text": dtext, "t0": round(dt0, 2),
                   "n": n_chunk})
+            if flush_now:
+                emit({"type": "flushed"})
     except KeyboardInterrupt:
         log("Interrupted.")
     finally:
@@ -767,11 +1010,21 @@ def cmd_live(p, args):
 
 
 def main():
+    # The protocol is UTF-8 JSON. Left alone, a pipe inherits the console code
+    # page (cp1252 on Windows), so a device name or a "…" would be written as
+    # invalid UTF-8 and arrive in the TUI as replacement characters.
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+    except (AttributeError, ValueError):
+        pass
     ap = argparse.ArgumentParser(description="Earshot backend")
     ap.add_argument("--list-devices", action="store_true")
     ap.add_argument("--live", action="store_true",
                     help="continuous transcription loop")
     ap.add_argument("--device-index", type=int, default=None)
+    ap.add_argument("--input", choices=["mic", "loopback"], default="loopback",
+                    help="audio source: 'mic' for dictation, 'loopback' for "
+                         "system audio (the TUI switches this at runtime)")
     ap.add_argument("--dump-secs", type=float, default=5.0)
     ap.add_argument("--dump-file", default="m1_probe.wav")
     ap.add_argument("--frames-per-buffer", type=int, default=512)
@@ -840,9 +1093,13 @@ def main():
                          "(0 = off; carries vocabulary across flushes but "
                          "risks hallucination)")
     ap.add_argument("--language", default="en")
-    ap.add_argument("--beam-size", type=int, default=5,
-                    help="beam width; 1 is greedy and cannot recover a bad "
-                         "early token")
+    ap.add_argument("--beam-size", type=int, default=1,
+                    help="beam width. 1 (default) is greedy: on "
+                         "call-quality audio hot spans it saves 0.6-0.9s "
+                         "per 30s decode and cannot wander (docs/"
+                         "latency-measurements.md mitigation sweep). Wider "
+                         "beams recover a bad early token, which mattered "
+                         "more on clean narration")
     ap.add_argument("--no-speech-threshold", type=float, default=0.6,
                     help="above this no-speech probability, read silence as silence")
     ap.add_argument("--hallucination-silence-threshold", type=float, default=2.0,
@@ -862,6 +1119,11 @@ def main():
                     help="threads for the LLM (0 = auto). The backend sets "
                          "OMP_NUM_THREADS=1 for resampling, so this must be set "
                          "explicitly or the model runs single-threaded")
+    ap.add_argument("--correct-sentences", action="store_true",
+                    help="patch each committed sentence as it lands (the old "
+                         "behaviour). Off by default: voice-to-text polishes the "
+                         "whole document instead, and doing both is twice the "
+                         "work for one result")
     ap.add_argument("--vad-min-silence-ms", type=int, default=150,
                     help="Silero VAD silence needed to split a segment")
     ap.add_argument("--vad-pad-ms", type=int, default=50,

@@ -43,6 +43,37 @@ def make(model, **kw):
     return RollingStreamer(model, **kw)
 
 
+# ---- source switching: the stream must not splice two devices ----
+
+
+def test_reset_drops_audio_and_pending_words_but_keeps_the_clock():
+    rs = make(None)
+    rs.buf = np.zeros(TARGET_RATE, dtype=np.float32)
+    rs.buf_t0 = 12.0
+    rs.sp.prev = [W("half", 0, .2)]
+    rs.sp.stalled = 3
+    rs.history = "old words"
+    rs.pass_secs = 4.2
+    rs.pass_empty = True
+    rs._arrival_perf = 1.0
+    rs.reset(resume_at=13.5)
+
+    assert rs.buf_secs == 0
+    assert rs.buf_t0 == 13.5
+    assert rs.sp.prev == [] and rs.sp.stalled == 0
+    assert rs.history == ""
+    assert rs.pass_secs == 0 and not rs.pass_empty
+    assert rs.word_latency(W("x", 13.0, 13.5)) == 0.0
+
+
+def test_reset_accepts_new_audio_afterwards():
+    rs = make(None)
+    rs.reset(resume_at=7.0)
+    rs.feed(np.zeros(TARGET_RATE // 10, dtype=np.float32))
+    assert rs.buf_t0 == 7.0
+    assert abs(rs.buf_secs - 0.1) < 1e-6
+
+
 # ---- VAD gate: the defence against non-speech hallucinations ----
 
 
@@ -340,6 +371,32 @@ def test_flush_commits_remaining_words():
     assert txt(unstable) == "hello world"
     assert txt(rs.flush()) == "hello world"
     assert rs.sp.unstable == []
+
+
+def test_commit_now_commits_and_cuts_the_audio():
+    """A mid-session flush must not let the next pass re-emit the same words.
+
+    flush() alone leaves the decoded audio in the buffer, so the next pass
+    would produce the same hypothesis again and commit it twice.
+    """
+    m = FakeModel()
+    rs = make(m, min_secs=0.1, pause_secs=99)
+    rs.feed(np.zeros(16000, dtype=np.float32))
+    assert txt(rs.commit_now()) == "hello world"
+    assert rs.buf_secs == 0
+    assert rs.sp.unstable == []
+
+    # The fake model has no idea the audio was cut, so a fresh decode can
+    # produce words again; what matters is that they are not *committed* on
+    # the back of the old hypothesis.
+    committed, _ = rs.feed(np.zeros(8000, dtype=np.float32))
+    assert txt(committed) == "", "the flushed words must not be committed twice"
+
+
+def test_commit_now_with_no_audio_is_a_no_op():
+    rs = make(FakeModel(), min_secs=0.1)
+    assert rs.commit_now() == []
+    assert rs.buf_secs == 0
 
 
 def test_help_text_renders():
